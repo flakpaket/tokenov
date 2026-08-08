@@ -1,0 +1,8 @@
+target/
+
+# Candidate wordlist / scratch text dumps (generated; never commit)
+*.txt
+# ...except source assets embedded via include_str! (must be tracked, or clones
+# fail to build).
+!src/logo.txt
+.claude/

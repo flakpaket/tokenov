@@ -1,0 +1,91 @@
+# tokenov default tokenizer manifest.
+#
+# Maps a short alias to an UNGATED HuggingFace `tokenizer.json` URL so
+# `tokenov fetch <alias>` / `tokenov fetch --all` / `tokenov bootstrap` can
+# curl every project tokenizer with no HF auth token.
+#
+# This file is embedded into the binary at compile time (include_str!), so a
+# fresh box needs no external manifest. Override at runtime with
+# `--manifest <path>` to point at a different table.
+#
+# URL pattern: https://huggingface.co/<repo>/resolve/main/tokenizer.json
+# Where a repo is gated (meta-llama/*, google/gemma-*, mistralai/*) the `url`
+# below already points at a verified ungated mirror; the gated canonical repo
+# is recorded in `note` for provenance.
+#
+# A `url` of the form `bundled:<name>` is NOT fetched — it resolves to a
+# tokenizer.json embedded in the binary at compile time (zero network). Used for
+# the shipped default `tokenov_v1`. See src/bootstrap.rs::bundled_source.
+#
+# `default_alias` is what a zero-argument `tokenov bootstrap` resolves.
+
+default_alias = "tokenov_v1"
+
+# ── The bundled default ──────────────────────────────────────────────────────
+# "Tokenov tokenizer v1" — shipped in-repo at tokenizers/tokenov_v1/tokenizer.json
+# and embedded in the binary, so a fresh install works offline.
+#
+# ATTRIBUTION: derivative of OpenAI GPT-2 (openai-community/gpt2, MIT) — GPT-2's
+# 50,257-token byte-level BPE vocab + merges, UNCHANGED. The only modification is a
+# prepended `Split(\p{N}{1,2})` digit pre-tokenizer (`2007` -> `20|07`), which
+# tests as a strong, license-clean alphabet. Provenance + license note:
+# tokenizers/tokenov_v1/ATTRIBUTION.md.
+[[tokenizer]]
+alias = "tokenov_v1"
+url = "bundled:tokenov_v1"
+note = "Tokenov tokenizer v1 — the shipped default. OpenAI GPT-2 (MIT) vocab + a \\p{N}{1,2} digit pre-tokenizer (Phase-18 winner). Bundled in the binary; needs no network."
+
+[[tokenizer]]
+alias = "llama3"
+url = "https://huggingface.co/unsloth/llama-3-8b/resolve/main/tokenizer.json"
+note = "LLaMA-3 (128K). Project headline tokenizer. unsloth mirror of gated meta-llama/Meta-Llama-3-8B."
+
+[[tokenizer]]
+alias = "qwen25_7b"
+url = "https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/tokenizer.json"
+note = "Qwen2.5 (~152K, byte-level BPE/tiktoken). Default bootstrap tokenizer — the project's qwen champion. Ungated."
+
+[[tokenizer]]
+alias = "gpt2"
+url = "https://huggingface.co/openai-community/gpt2/resolve/main/tokenizer.json"
+note = "Generation-1 BPE baseline (50K). Smallest fetch (~2 MB) — handy smoke test. Ungated."
+
+[[tokenizer]]
+alias = "mistral7b"
+url = "https://huggingface.co/unsloth/mistral-7b/resolve/main/tokenizer.json"
+note = "Mistral-7B (32K byte-fallback BPE). unsloth mirror of gated mistralai/Mistral-7B-v0.1."
+
+[[tokenizer]]
+alias = "llama2"
+url = "https://huggingface.co/NousResearch/Llama-2-7b-hf/resolve/main/tokenizer.json"
+note = "LLaMA-2 (32K). NousResearch mirror of gated meta-llama/Llama-2-7b-hf."
+
+[[tokenizer]]
+alias = "falcon7b"
+url = "https://huggingface.co/tiiuae/falcon-7b/resolve/main/tokenizer.json"
+note = "Falcon-7B (65K byte-level BPE on RefinedWeb). Ungated."
+
+[[tokenizer]]
+alias = "gemma2_2b"
+url = "https://huggingface.co/unsloth/gemma-2-2b/resolve/main/tokenizer.json"
+note = "Gemma-2 (256K SentencePiece BPE w/ digit splitting). unsloth mirror of gated google/gemma-2-2b."
+
+[[tokenizer]]
+alias = "xlm_roberta"
+url = "https://huggingface.co/FacebookAI/xlm-roberta-large/resolve/main/tokenizer.json"
+note = "XLM-RoBERTa (250K SentencePiece Unigram, 100 languages). Ungated."
+
+[[tokenizer]]
+alias = "bert_chinese"
+url = "https://huggingface.co/bert-base-chinese/resolve/main/tokenizer.json"
+note = "BERT Chinese (~21K char-level CJK WordPiece). Ungated."
+
+# NOT FETCHABLE via curl — intentionally omitted from this manifest:
+#   rubert      (DeepPavlov/rubert-base-cased)
+#   rubert_conv (DeepPavlov/rubert-base-cased-conversational)
+# These repos ship only `vocab.txt`; there is no `tokenizer.json` at
+# resolve/main (verified 404, 2026-06-29) and no faithful ungated mirror with
+# one. `transformers` builds the fast tokenizer from vocab.txt at load time, so
+# the Python sweep (scripts/tokenizer_corpus_sweep.py via from_pretrained) can
+# still use them — but a no-auth curl bootstrap cannot. They remain in
+# scripts/tokenizer_sweep_config.toml (Python path) with this caveat noted.

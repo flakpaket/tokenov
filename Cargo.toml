@@ -1,0 +1,30 @@
+[package]
+name = "tokenov"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A tool to generate passwords using LLM tokens and Markov chains."
+license = "Apache-2.0"
+repository = "https://github.com/flakpaket/tokenov"
+readme = "README.md"
+keywords = ["password", "markov", "tokenizer", "security", "wordlist"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "tokenov"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[dependencies]
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+rustc-hash = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+crossbeam-channel = "0.5"
+encoding_rs = "0.8"
+sha2 = "0.10"
