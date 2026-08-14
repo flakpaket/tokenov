@@ -503,6 +503,12 @@ Two flags reshape the emitted candidates at generation time:
   targets policy-enforced systems, where the bulk of an unshaped stream is
   wasted on candidates the target would never accept.
 
+  Use `--enterprise-min-chars <N>` and `--enterprise-max-chars <N>` to
+  override the inclusive character-count bounds; either option implies
+  `--enterprise`, and values below 8 are allowed. Set both to the same value
+  for an exact length. These policy bounds count Unicode characters, while the
+  general `--min-len` / `--max-len` bounds count decoded bytes.
+
 ### `tokenov score`
 
 The inverse of `generate`: instead of emitting candidates in probability
@@ -740,6 +746,8 @@ use `--json` to get the machine telemetry stream on stderr without `-v`.
 | `--min-tokens <N>` | minimum tokens per candidate (drop-at-emit floor; 1 = no-op) | 1 |
 | `--case-shape <SPEC>` | re-case each token (per-slot `?l`/`?c`/`?u`, or `lower`/`cap1`/`title`/`upper`; `;`-separated) | (off) |
 | `--enterprise` | emit only policy-compliant candidates (≥8 chars + ≥3 of 5 classes; capitalize-first repair) | (off) |
+| `--enterprise-min-chars <N>` | enterprise minimum in characters; implies `--enterprise` | 8 |
+| `--enterprise-max-chars <N>` | inclusive enterprise maximum in characters; implies `--enterprise` | unbounded |
 | `--wordlist <PATH>` | OSINT/target wordlist (one entry per line) | (none → standard mode) |
 | `--append-only` | append affixes to the seed (seed stays prefix) | **default** for `--wordlist` |
 | `--prepend-only` | prepend affixes (seed becomes suffix) | (off) |

@@ -757,8 +757,8 @@ struct GenerateArgs {
     /// Enterprise-policy compliance mode: emit only policy-compliant candidates,
     /// applying the minimal repair (capitalize-first) to each one.
     ///
-    /// Policy = byte-length >= 8 AND at least 3 of {lowercase, uppercase, digit,
-    /// special}. Per candidate:
+    /// Policy = character-count >= 8 AND at least 3 of {lowercase, uppercase,
+    /// digit, special, other alphabetic}. Per candidate:
     ///   1. already compliant             -> emit as-is
     ///   2. first char [a-z], no capital  -> capitalize it (+0 length), re-check;
     ///                                        emit if now compliant
@@ -776,6 +776,22 @@ struct GenerateArgs {
     #[arg(long, help_heading = "Case shaping",
           conflicts_with_all = ["case_shape"])]
     enterprise: bool,
+
+    /// Override the enterprise policy's minimum candidate length in characters.
+    ///
+    /// Supplying this option implies --enterprise. Values below 8 are allowed.
+    /// When omitted, enterprise mode retains its default minimum of 8.
+    #[arg(long, value_name = "N", help_heading = "Case shaping",
+          conflicts_with_all = ["case_shape"])]
+    enterprise_min_chars: Option<usize>,
+
+    /// Set an inclusive maximum enterprise candidate length in characters.
+    ///
+    /// Supplying this option implies --enterprise. When omitted, enterprise mode
+    /// has no policy-level character maximum; --max-len still limits bytes.
+    #[arg(long, value_name = "N", help_heading = "Case shaping",
+          conflicts_with_all = ["case_shape"])]
+    enterprise_max_chars: Option<usize>,
 
     // ── Memory safety ─────────────────────────────────────────────────────────
 
@@ -2742,8 +2758,30 @@ fn partition_seeds_by_first_token(seeds: Vec<HeapEntry>, n: usize) -> Vec<Vec<He
 // merge in `run_merger` above. See progress sidecar + --resume for crash
 // recovery instead of partial-file recovery.)
 
+fn resolve_enterprise_bounds(
+    args: &mut GenerateArgs,
+) -> Result<Option<enterprise::LengthBounds>> {
+    let implied = args.enterprise_min_chars.is_some() || args.enterprise_max_chars.is_some();
+
+    if implied {
+        args.enterprise = true;
+    }
+
+    if !args.enterprise {
+        return Ok(None);
+    }
+
+    let min_chars = args.enterprise_min_chars.unwrap_or(enterprise::DEFAULT_MIN_CHARS);
+    let max_chars = args.enterprise_max_chars;
+    if max_chars.is_some_and(|max| max < min_chars) {
+        bail!("--enterprise-max-chars cannot be less than --enterprise-min-chars (effective minimum: {min_chars})");
+    }
+    Ok(Some(enterprise::LengthBounds { min_chars, max_chars }))
+}
+
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // Validate
+    let enterprise_bounds = resolve_enterprise_bounds(&mut args)?;
     if args.bias <= 0.0 {
         bail!("--bias must be positive (got {})", args.bias);
     }
@@ -2939,7 +2977,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // dropped) so it can read the model's unigram/decode tiers.
     if run_graft {
         return match &entry_seqs_opt {
-            Some(entry_seqs) => graft::run(&args, &enum_model, &post_bias_model, entry_seqs),
+            Some(entry_seqs) => graft::run(&args, &enum_model, &post_bias_model, entry_seqs, enterprise_bounds),
             None => unreachable!("run_graft implies wordlist present"),
         };
     }
@@ -3216,7 +3254,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             model.start_id, model.end_id, initial_states,
             args.max_tokens, args.min_tokens, args.min_len, args.max_len,
             target_count,
-            args.enterprise,
+            enterprise_bounds,
             &case_masks,
             |_lvl, _sk, bytes| {
                 {
@@ -3446,7 +3484,6 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     let min_tokens    = args.min_tokens;
     let min_len       = args.min_len;
     let max_len       = args.max_len;
-    let enterprise    = args.enterprise;
 
     // (--fast/--strict and strict+checkpoint validation, plus checkpoint_to/resume_from
     // resolution, done up front near the args fingerprint.)
@@ -3619,7 +3656,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     });
                     let res = enumerate_to_sink(
                         &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
-                        states, max_tokens, min_tokens, min_len, max_len, thread_target, enterprise, &cm,
+                        states, max_tokens, min_tokens, min_len, max_len, thread_target, enterprise_bounds, &cm,
                         |_lvl, _sk, bytes| {
                             let mut e = em_cell.borrow_mut();
                             e.buf.extend_from_slice(bytes);
@@ -3847,7 +3884,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
                     states, max_tokens, min_tokens, min_len, max_len,
                     thread_target,
-                    enterprise,
+                    enterprise_bounds,
                     &cm,
                     |lvl, sk, bytes| chunk_sender.push(lvl, sk, bytes),
                     &label,
@@ -4606,11 +4643,21 @@ fn build_args_fingerprint(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut s = String::new();
+    let enterprise_min_chars = args
+        .enterprise
+        .then(|| args.enterprise_min_chars.unwrap_or(enterprise::DEFAULT_MIN_CHARS));
+    let enterprise_max_chars = if args.enterprise {
+        args.enterprise_max_chars
+    } else {
+        None
+    };
     write!(s, "model={} size={} mtime={} ",
         model_path.display(), size, mtime).unwrap();
     write!(s, "threads={} count={:?} ", n_threads, args.count).unwrap();
     write!(s, "min_len={} max_len={} max_tokens={} min_tokens={} ",
         args.min_len, args.max_len, args.max_tokens, args.min_tokens).unwrap();
+    write!(s, "enterprise={} enterprise_min_chars={:?} enterprise_max_chars={:?} ",
+        args.enterprise, enterprise_min_chars, enterprise_max_chars).unwrap();
     write!(s, "mode={:?} bias={} seed_mode={:?} prepend_only={} append_only={} float={} ",
         args.mode, args.bias, args.seed_mode, args.prepend_only, args.append_only, args.float).unwrap();
     write!(s, "skipgram_expand={} skipgram_direction={:?} ",
@@ -5210,7 +5257,7 @@ fn enumerate_to_sink<F, H>(
     min_len: usize,
     max_len: usize,
     target_count: u64,
-    enterprise: bool,
+    enterprise_bounds: Option<enterprise::LengthBounds>,
     case_masks: &[CaseMask],
     mut emit: F,
     thread_label: &str,
@@ -5488,14 +5535,14 @@ where
                             let has_nl = nl_count > 0
                                 && bytes_buf[rs..re].iter().any(|&c| c == b'\n' || c == b'\r');
                             if len > 0 && len >= min_len && len <= max_len && !has_nl {
-                                if enterprise {
+                                if let Some(bounds) = enterprise_bounds {
                                     // Enterprise-policy mode: emit only compliant
                                     // candidates, capitalizing the first byte when
                                     // that is the sole missing class; drop the rest.
                                     // Dropped candidates do NOT count toward
                                     // `emitted`, so the DFS keeps pulling deeper to
                                     // reach the target budget (drop-and-continue).
-                                    match enterprise::decide(&bytes_buf[rs..re]) {
+                                    match enterprise::decide_with_bounds(&bytes_buf[rs..re], bounds) {
                                         enterprise::Decision::AsIs => {
                                             emit(target_level, sort_key, &bytes_buf[rs..re])?;
                                             emitted += 1;
@@ -6654,7 +6701,7 @@ fn do_calibration(
                     &em, &*var, cc, CacheMode::Full, &dt, kind, start_id, end_id,
                     states, max_tokens, 1 /* min_tokens: no filter during calibration */, min_len, max_len,
                     thread_target,
-                    false, // no enterprise filter during calibration
+                    None, // no enterprise filter during calibration
                     &[],   // no case masks during calibration
                     |lvl, sk, bytes| {
                         if stop.load(AtomicOrdering::Relaxed) {
@@ -7109,6 +7156,55 @@ fn run_tokenizer(args: TokenizerArgs) -> Result<()> {
         Some(TokenizerCmd::Delete(a)) => bootstrap::run_tok_delete(a),
         Some(TokenizerCmd::SetDefault(a)) => bootstrap::run_set_default(a),
         Some(TokenizerCmd::List) | None => bootstrap::run_list_status(None, None),
+    }
+}
+
+#[cfg(test)]
+mod enterprise_arg_tests {
+    use super::*;
+
+    #[test]
+    fn minimum_switch_implies_enterprise_and_allows_below_eight() {
+        let mut args = GenerateArgs::default();
+        args.enterprise_min_chars = Some(6);
+
+        let bounds = resolve_enterprise_bounds(&mut args).unwrap().unwrap();
+
+        assert!(args.enterprise);
+        assert_eq!(bounds.min_chars, 6);
+        assert_eq!(bounds.max_chars, None);
+    }
+
+    #[test]
+    fn maximum_switch_implies_enterprise_with_default_minimum() {
+        let mut args = GenerateArgs::default();
+        args.enterprise_max_chars = Some(16);
+
+        let bounds = resolve_enterprise_bounds(&mut args).unwrap().unwrap();
+
+        assert!(args.enterprise);
+        assert_eq!(bounds.min_chars, enterprise::DEFAULT_MIN_CHARS);
+        assert_eq!(bounds.max_chars, Some(16));
+    }
+
+    #[test]
+    fn plain_enterprise_preserves_default_bounds() {
+        let mut args = GenerateArgs::default();
+        args.enterprise = true;
+
+        let bounds = resolve_enterprise_bounds(&mut args).unwrap().unwrap();
+
+        assert_eq!(bounds, enterprise::LengthBounds::default());
+    }
+
+    #[test]
+    fn maximum_below_effective_minimum_is_rejected() {
+        let mut args = GenerateArgs::default();
+        args.enterprise_max_chars = Some(7);
+
+        let err = resolve_enterprise_bounds(&mut args).unwrap_err();
+
+        assert!(err.to_string().contains("effective minimum: 8"));
     }
 }
 

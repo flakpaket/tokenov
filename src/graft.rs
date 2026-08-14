@@ -13,6 +13,7 @@
 //! Markov enumerator (it does not touch the seeds/bias/heap paths), so standard
 //! mode and the legacy `weighted|seeded|combined` modes stay byte-identical.
 
+use crate::enterprise::{Decision, LengthBounds};
 use crate::variant::EnumModel;
 use crate::{Ctx, GenerateArgs, Model};
 use anyhow::Result;
@@ -176,6 +177,7 @@ struct Emitter<'a> {
     min_len: usize,
     max_len: usize,
     min_tokens: usize,
+    enterprise_bounds: Option<LengthBounds>,
     emitted: u64,
     dupes: u64,
 }
@@ -189,11 +191,24 @@ impl<'a> Emitter<'a> {
         if cand.len() < self.min_tokens {
             return Ok(false);
         }
-        let s = decode_ids(self.decode, cand);
-        let len = s.chars().count();
+        let mut bytes = decode_ids(self.decode, cand).into_bytes();
+        let len = bytes.len();
         if len < self.min_len || len > self.max_len {
             return Ok(false);
         }
+
+        if let Some(bounds) = self.enterprise_bounds {
+            match crate::enterprise::decide_with_bounds(&bytes, bounds) {
+                Decision::AsIs => {}
+                Decision::Cap => {
+                    bytes[0] = bytes[0].to_ascii_uppercase();
+                }
+                Decision::Drop => return Ok(false),
+            }
+        }
+
+        // Repair before dedup so repaired collisions are emitted only once.
+        let s = String::from_utf8(bytes).expect("decode_ids returned valid UTF-8");
         if self.seen.contains(&s) {
             self.dupes += 1;
             return Ok(false);
@@ -208,7 +223,13 @@ impl<'a> Emitter<'a> {
 /// Entry point for the default --wordlist graft generator. Emits rarity-weighted combinations:
 /// rarest seed first; per-seed and per-chunk budget ∝ surprisal; each anchor
 /// combined with the affix pool (+ other seeds' distinctive chunks for mixing).
-pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec<u32>]) -> Result<()> {
+pub fn run(
+    args: &GenerateArgs,
+    em: &EnumModel,
+    model: &Model,
+    entry_seqs: &[Vec<u32>],
+    enterprise_bounds: Option<LengthBounds>,
+) -> Result<()> {
     let start_id = model.start_id;
     let uni = &model.unigram_kn_cont;
     let decode = &model.decode;
@@ -259,6 +280,7 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
         min_len: args.min_len,
         max_len: args.max_len,
         min_tokens: args.min_tokens,
+        enterprise_bounds,
         emitted: 0,
         dupes: 0,
     };

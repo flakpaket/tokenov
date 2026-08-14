@@ -47,8 +47,34 @@
 //! not always length-preserving, which would break the emit buffer's byte
 //! bookkeeping); this is a negligible miss.
 
-/// Minimum compliant length, in characters.
-pub const MIN_LEN: usize = 8;
+/// Default minimum compliant length, in Unicode scalar values.
+pub const DEFAULT_MIN_CHARS: usize = 8;
+
+/// Inclusive character-count bounds for enterprise-policy candidates.
+///
+/// `max_chars = None` means there is no policy-level maximum. The generator's
+/// independent byte-length bounds still apply before this policy is evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LengthBounds {
+    pub min_chars: usize,
+    pub max_chars: Option<usize>,
+}
+
+impl Default for LengthBounds {
+    fn default() -> Self {
+        Self {
+            min_chars: DEFAULT_MIN_CHARS,
+            max_chars: None,
+        }
+    }
+}
+
+impl LengthBounds {
+    #[inline]
+    fn contains(self, n_chars: usize) -> bool {
+        n_chars >= self.min_chars && self.max_chars.is_none_or(|max| n_chars <= max)
+    }
+}
 
 /// Class bits.
 pub const CL_L: u8 = 1; // lowercase letter
@@ -110,7 +136,7 @@ pub fn n_classes(m: u8) -> u32 {
 #[cfg(test)]
 #[inline]
 pub fn compliant_str(s: &str) -> bool {
-    s.chars().count() >= MIN_LEN && n_classes(classes_str(s)) >= 3
+    LengthBounds::default().contains(s.chars().count()) && n_classes(classes_str(s)) >= 3
 }
 
 /// Enterprise policy on raw bytes. Invalid UTF-8 is non-compliant.
@@ -134,14 +160,21 @@ pub enum Decision {
 }
 
 /// Decide the L0 action for `b` without mutating it.
+#[cfg(test)]
 #[inline]
 pub fn decide(b: &[u8]) -> Decision {
+    decide_with_bounds(b, LengthBounds::default())
+}
+
+/// Decide the L0 action for `b` using explicit inclusive character bounds.
+#[inline]
+pub fn decide_with_bounds(b: &[u8], bounds: LengthBounds) -> Decision {
     let s = match std::str::from_utf8(b) {
         Ok(s) => s,
         Err(_) => return Decision::Drop, // not a settable password
     };
     // Cap adds no length, so a sub-floor candidate can never be repaired.
-    if s.chars().count() < MIN_LEN {
+    if !bounds.contains(s.chars().count()) {
         return Decision::Drop;
     }
     let cls = classes_str(s);
@@ -153,7 +186,7 @@ pub fn decide(b: &[u8]) -> Decision {
     // honest post-cap class set is `classes(tail) | U` — recomputed on `&s[1..]`
     // (valid boundary: an ASCII byte is a whole char). This is what stops
     // `a2345678` (post-cap `A2345678` = {U,D} = 2) from being emitted.
-    if b[0].is_ascii_lowercase() && (cls & CL_U == 0) {
+    if b.first().is_some_and(|c| c.is_ascii_lowercase()) && (cls & CL_U == 0) {
         let post = classes_str(&s[1..]) | CL_U;
         if n_classes(post) >= 3 {
             return Decision::Cap;
@@ -243,6 +276,46 @@ mod tests {
     fn invalid_utf8_is_dropped() {
         assert_eq!(decide(&[0xff, 0xfe, b'a', b'b', b'c', b'1', b'2', b'3']), Decision::Drop);
         assert!(!compliant(&[0xff, 0xfe]));
+    }
+
+    #[test]
+    fn explicit_bounds_can_lower_the_default_floor() {
+        let four_chars = LengthBounds {
+            min_chars: 4,
+            max_chars: None,
+        };
+        assert_eq!(decide(b"Abc1"), Decision::Drop);
+        assert_eq!(decide_with_bounds(b"Abc1", four_chars), Decision::AsIs);
+    }
+
+    #[test]
+    fn explicit_maximum_is_inclusive() {
+        let max_eight = LengthBounds {
+            min_chars: 0,
+            max_chars: Some(8),
+        };
+        let max_nine = LengthBounds {
+            min_chars: 0,
+            max_chars: Some(9),
+        };
+        assert_eq!(decide_with_bounds(b"Password1", max_eight), Decision::Drop);
+        assert_eq!(decide_with_bounds(b"Password1", max_nine), Decision::AsIs);
+    }
+
+    #[test]
+    fn explicit_bounds_count_characters_not_bytes() {
+        let exactly_seven = LengthBounds {
+            min_chars: 7,
+            max_chars: Some(7),
+        };
+        assert_eq!(
+            decide_with_bounds("Añ1seño".as_bytes(), exactly_seven),
+            Decision::AsIs
+        );
+        assert_eq!(
+            decide_with_bounds("Añ1señor".as_bytes(), exactly_seven),
+            Decision::Drop
+        );
     }
 
     #[test]
