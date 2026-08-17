@@ -597,11 +597,10 @@ struct GenerateArgs {
     ///
     /// Enumeration walks levels 0, 1, 2, … in order, so --count is a ceiling on
     /// depth and this is the matching floor. The stream is an exact suffix of the
-    /// full run — same candidates, same order, minus the skipped shells — so two
-    /// hosts can split one keyspace (`--min-level 0` up to some count, plus
-    /// `--min-level N` from where it stopped) with no overlap and no gaps. Long
-    /// candidates concentrate at higher levels, but the overlap is wide: this is a
-    /// stream-volume knob, not a length filter — use it with --min-len.
+    /// full run: same candidates, same order, minus the skipped levels. Long
+    /// candidates concentrate at higher levels, but the overlap is wide — this is
+    /// a stream-volume knob, not a length filter; use it with --min-len. Run with
+    /// -v to see the level a run stopped at.
     #[arg(long, default_value_t = 0, value_name = "N", help_heading = "Generation")]
     min_level: u32,
 
@@ -5403,7 +5402,11 @@ where
                 thread_label, r.init_idx, states.len());
         }
     }
+    // Shell this worker was in when it stopped — reported on the DONE line so an
+    // operator who ended a run with --count can see where to point --min-level.
+    let mut last_level = resume_tl;
     'main: for target_level in resume_tl..=LEVEL_MAX {
+        last_level = target_level;
         // On resume the first pass starts at the saved init_idx (earlier inits in
         // that pass already completed pre-checkpoint); later passes start at 0.
         let init_start = if target_level == resume_tl { resume_ii } else { 0 };
@@ -5672,8 +5675,9 @@ where
         format!(" bounded[hits={} misses={} hit_rate={:.1}% resident={}]",
             b.hits, b.misses, hr, b.young.len() + b.old.len())
     }).unwrap_or_default();
-    log_msg(&format!("{}[gen] DONE emitted={} local_misses={}{} in {:.0}s",
-        thread_label, emitted, local_misses, bounded_stats, t0.elapsed().as_secs_f64()));
+    log_msg(&format!("{}[gen] DONE emitted={} local_misses={}{} in {:.0}s level={}",
+        thread_label, emitted, local_misses, bounded_stats, t0.elapsed().as_secs_f64(),
+        last_level));
     Ok(())
 }
 

@@ -694,13 +694,21 @@ the target, so the shells partition the candidate space with no overlap
 and no gaps. `--count` is therefore a ceiling on that sweep, and
 `--min-level N` is the matching floor: it starts at shell `N`, and its
 stream is an exact suffix of the same run without the flag — same
-candidates, same order, minus the skipped shells. Two hosts can split one
-keyspace with it (host A runs from level 0 to wherever its `--count`
-lands, host B picks up at that level) with no duplicates. What it saves
-is stream volume and downstream cracker time, not generator CPU: the
-skipped low shells are individually the cheap ones. Longer candidates do
-concentrate in the higher shells, but the overlap is wide — pair it with
-`--min-len` when length is what you actually want.
+candidates, same order, minus the skipped shells. What it saves is stream
+volume and downstream cracker time, not generator CPU: the skipped low
+shells are individually the cheap ones. Longer candidates do concentrate
+in the higher shells, but the overlap is wide — pair it with `--min-len`
+when length is what you actually want.
+
+Splitting one keyspace across hosts works, with one caveat: `--count`
+stops mid-shell, not on a shell boundary. Run host A with `--strict -v`
+and read the level it stopped at from its `[gen] DONE … level=L` line,
+then start host B at `--min-level L`. Shell `L` is re-emitted in full, so
+the two streams **overlap** by part of one shell — duplicates, which cost
+a cracker little, rather than a silent gap, which costs it a password. An
+exactly clean cut needs a `--count` that happens to land on a shell
+boundary. In fast mode each worker stops at its own share of the count
+and reports its own `level=`, so use the lowest one, or use `--strict`.
 
 **Parallelization**: domain decomposition by first-level token. In the
 default **fast** mode each thread level-sweeps a disjoint first-level
