@@ -253,7 +253,7 @@ struct Cli {
     // Declared after the flatten so the "Generation" heading leads `-h` (heading
     // order follows first-encounter). These two join the "Resume & checkpointing"
     // block via the shared heading regardless of position.
-    /// List the last 10 recorded sessions and exit.
+    /// List recent generation sessions and exit (newest first).
     #[arg(long, help_heading = "Resume & checkpointing")]
     sessions: bool,
 
@@ -4842,7 +4842,11 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
 // handle). One file per session under the state dir; ring-buffer at MAX_SESSIONS.
 // ============================================================================
 
-const MAX_SESSIONS: usize = 10;
+// A session record is ~500 bytes today (a few KB once the checkpoint moves into it),
+// so retaining a deep history costs single-digit MB. Keep it large: evicting a record
+// still holding a live resume position loses the run, and a short throwaway run must
+// never be able to push out a long one.
+const MAX_SESSIONS: usize = 1000;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -4990,7 +4994,12 @@ fn fmt_ago(secs: u64) -> String {
     else { format!("{}d ago", d / 86400) }
 }
 
-/// `--sessions`: print the last MAX_SESSIONS sessions, newest first.
+/// How many sessions `--sessions` prints. Retention (MAX_SESSIONS) is deliberately
+/// much larger — a resumable position should outlive the listing that shows it — so
+/// the default view is trimmed to the recent ones and the rest stay on disk.
+const SESSION_LIST_LIMIT: usize = 20;
+
+/// `--sessions`: print the most recent sessions, newest first.
 fn list_sessions() -> Result<()> {
     let recs = load_sessions();
     if recs.is_empty() {
@@ -4998,13 +5007,17 @@ fn list_sessions() -> Result<()> {
         return Ok(());
     }
     println!("{:<22} {:<10} {:>10} {:<8} {:<10} model", "ID", "WHEN", "EMITTED", "THREADS", "STATUS");
-    for r in &recs {
+    let shown = recs.len().min(SESSION_LIST_LIMIT);
+    for r in recs.iter().take(shown) {
         let status = if r.status == "done" { "done".to_string() }
             else if pid_alive(r.pid) { "running".to_string() }
             else { "interrupted".to_string() };
         let model = Path::new(&r.model).file_name().and_then(|s| s.to_str()).unwrap_or(&r.model);
         println!("{:<22} {:<10} {:>10} {:<8} {:<10} {}",
             r.id, fmt_ago(r.started_at), r.emitted, r.threads, status, model);
+    }
+    if recs.len() > shown {
+        println!("... and {} older (all still resumable)", recs.len() - shown);
     }
     println!("\nresume one with:  tokenov --resume-session <ID> | hashcat …");
     Ok(())
