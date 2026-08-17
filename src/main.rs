@@ -592,6 +592,19 @@ struct GenerateArgs {
     #[arg(long, default_value_t = 1, value_name = "N", help_heading = "Generation")]
     min_tokens: usize,
 
+    /// Start enumeration at probability level N, skipping the more-probable
+    /// shells below it. 0 (default) is a no-op.
+    ///
+    /// Enumeration walks levels 0, 1, 2, … in order, so --count is a ceiling on
+    /// depth and this is the matching floor. The stream is an exact suffix of the
+    /// full run — same candidates, same order, minus the skipped shells — so two
+    /// hosts can split one keyspace (`--min-level 0` up to some count, plus
+    /// `--min-level N` from where it stopped) with no overlap and no gaps. Long
+    /// candidates concentrate at higher levels, but the overlap is wide: this is a
+    /// stream-volume knob, not a length filter — use it with --min-len.
+    #[arg(long, default_value_t = 0, value_name = "N", help_heading = "Generation")]
+    min_level: u32,
+
     /// Write candidates (plain UTF-8, one per line) here instead of stdout.
     ///
     /// Output is uncompressed; pipe through gzip/zstd/7z to compress at rest.
@@ -2742,6 +2755,23 @@ fn partition_seeds_by_first_token(seeds: Vec<HeapEntry>, n: usize) -> Vec<Vec<He
 // merge in `run_merger` above. See progress sidecar + --resume for crash
 // recovery instead of partial-file recovery.)
 
+/// `--min-level` is a floor on the enumerator's level sweep. Reject, rather than
+/// ignore, the two settings where it would silently do nothing: past `LEVEL_MAX`
+/// the sweep is empty and the run emits not one candidate, and the graft
+/// generator has no level sweep to floor at all.
+fn validate_min_level(min_level: u32, run_graft: bool, float: bool) -> Result<()> {
+    if min_level > LEVEL_MAX {
+        bail!("--min-level ({}) exceeds the maximum level {} — nothing would be emitted",
+            min_level, LEVEL_MAX);
+    }
+    if min_level > 0 && run_graft {
+        bail!("--min-level has no effect with {} (that generator ranks seeds by \
+               surprisal instead of sweeping levels)",
+            if float { "--float" } else { "--prepend-only" });
+    }
+    Ok(())
+}
+
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // Validate
     if args.bias <= 0.0 {
@@ -2779,6 +2809,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     }
     let run_graft = args.wordlist.is_some() && args.mode.is_none()
         && (args.prepend_only || args.float);
+    validate_min_level(args.min_level, run_graft, args.float)?;
     // Concrete mode for the legacy machinery + the graft generator's unbiased
     // model prep. None → Seeded (unbiased; --append-only is exactly seeded).
     let legacy_mode: Mode = args.mode.unwrap_or(Mode::Seeded);
@@ -3111,6 +3142,18 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             _ => None, // NotStarted / empty → start fresh
         }
     } else { None };
+    // --resume wins over --min-level: a checkpoint already encodes a start
+    // position, and its target_level can only sit at or past the floor the run
+    // began with (--min-level is part of the fingerprint, which must match). A
+    // checkpoint below the floor therefore means a hand-edited or foreign state
+    // file — refuse rather than silently re-emit the skipped shells.
+    if let Some(c) = &strict_ckpt_resume {
+        if c.target_level < args.min_level {
+            bail!("--resume: checkpoint is at level {} but --min-level is {} — \
+                   resuming it would re-emit shells below the floor",
+                c.target_level, args.min_level);
+        }
+    }
 
     // Compute (skip_first, initial_bytes) from the progress sidecar if resuming.
     let (skip_first, initial_bytes): (u64, u64) = if strict_ckpt_resume.is_some() {
@@ -3215,6 +3258,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             &enum_model, &*variant, child_cache, cache_mode, &model.decode, kind,
             model.start_id, model.end_id, initial_states,
             args.max_tokens, args.min_tokens, args.min_len, args.max_len,
+            args.min_level,
             target_count,
             args.enterprise,
             &case_masks,
@@ -3446,6 +3490,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     let min_tokens    = args.min_tokens;
     let min_len       = args.min_len;
     let max_len       = args.max_len;
+    let min_level     = args.min_level;
     let enterprise    = args.enterprise;
 
     // (--fast/--strict and strict+checkpoint validation, plus checkpoint_to/resume_from
@@ -3503,6 +3548,17 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         }).collect();
         let worker_done: Vec<bool> =
             resume_slots.iter().map(|s| matches!(s, CkptSlot::Done)).collect();
+        // Same floor check as the strict path, over EVERY worker slot — checked
+        // here, before any worker spawns, so a bad state file can't leave a run
+        // half-started.
+        for (i, ck) in worker_resume.iter().enumerate() {
+            let Some(c) = ck else { continue };
+            if c.target_level < args.min_level {
+                bail!("--resume: worker {} checkpoint is at level {} but --min-level is {} — \
+                       resuming it would re-emit shells below the floor",
+                    i, c.target_level, args.min_level);
+            }
+        }
         let slots: Arc<Vec<std::sync::Mutex<CkptSlot>>> =
             Arc::new(resume_slots.into_iter().map(std::sync::Mutex::new).collect());
         let ckpt_stop = Arc::new(AtomicBool::new(false));
@@ -3619,7 +3675,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     });
                     let res = enumerate_to_sink(
                         &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
-                        states, max_tokens, min_tokens, min_len, max_len, thread_target, enterprise, &cm,
+                        states, max_tokens, min_tokens, min_len, max_len, min_level, thread_target, enterprise, &cm,
                         |_lvl, _sk, bytes| {
                             let mut e = em_cell.borrow_mut();
                             e.buf.extend_from_slice(bytes);
@@ -3846,6 +3902,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                 let res = enumerate_to_sink(
                     &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
                     states, max_tokens, min_tokens, min_len, max_len,
+                    min_level,
                     thread_target,
                     enterprise,
                     &cm,
@@ -4616,6 +4673,13 @@ fn build_args_fingerprint(
     write!(s, "skipgram_expand={} skipgram_direction={:?} ",
         args.skipgram_expand, args.skipgram_direction).unwrap();
     write!(s, "wordlist={:?}", args.wordlist).unwrap();
+    // Appended only when set, so a default run's fingerprint is unchanged from
+    // 1.0.0 and an in-flight `--no-checkpoint` sidecar resume still matches.
+    // (The checkpoint file's own fingerprint already carries the crate version,
+    // so it never crosses a release boundary anyway.)
+    if args.min_level > 0 {
+        write!(s, " min_level={}", args.min_level).unwrap();
+    }
     Ok(s)
 }
 
@@ -5222,6 +5286,10 @@ fn enumerate_to_sink<F, H>(
     min_tokens: usize,
     min_len: usize,
     max_len: usize,
+    // Floor on the level sweep (`--min-level`): shells below it are never walked,
+    // so the stream is an exact suffix of the same run at 0. Ignored when `resume`
+    // is Some — the checkpoint's own target_level already sits at or past the floor.
+    min_level: u32,
     target_count: u64,
     enterprise: bool,
     case_masks: &[CaseMask],
@@ -5244,7 +5312,7 @@ where
     let mut last_ckpt = Instant::now();
     let mut iter_ctr: u64 = 0;
     let (resume_tl, resume_ii) = resume.as_ref()
-        .map(|r| (r.target_level, r.init_idx)).unwrap_or((0, 0));
+        .map(|r| (r.target_level, r.init_idx)).unwrap_or((min_level, 0));
     let mut resume_taken = resume.is_none();
     let mut emitted: u64 = resume.as_ref().map(|r| r.emitted).unwrap_or(0);
     let mut decode_buf: Vec<u8> = Vec::with_capacity(64); // case-mask path only
@@ -6666,6 +6734,7 @@ fn do_calibration(
                     // cache here is always populated → CacheMode::Full.
                     &em, &*var, cc, CacheMode::Full, &dt, kind, start_id, end_id,
                     states, max_tokens, 1 /* min_tokens: no filter during calibration */, min_len, max_len,
+                    0, // min_level: calibration always sweeps from shell 0
                     thread_target,
                     false, // no enterprise filter during calibration
                     &[],   // no case masks during calibration
@@ -7259,3 +7328,26 @@ mod count_parse_tests {
     }
 }
 
+#[cfg(test)]
+mod min_level_tests {
+    use super::{validate_min_level, LEVEL_MAX};
+
+    #[test]
+    fn default_and_in_range_accepted() {
+        assert!(validate_min_level(0, false, false).is_ok());
+        assert!(validate_min_level(30, false, false).is_ok());
+        assert!(validate_min_level(LEVEL_MAX, false, false).is_ok());
+    }
+
+    #[test]
+    fn rejects_past_level_max() {
+        assert!(validate_min_level(LEVEL_MAX + 1, false, false).is_err());
+    }
+
+    #[test]
+    fn rejects_graft_combination_but_not_the_default() {
+        assert!(validate_min_level(30, true, true).is_err());   // --float
+        assert!(validate_min_level(30, true, false).is_err());  // --prepend-only
+        assert!(validate_min_level(0,  true, true).is_ok());    // unset ⇒ no conflict
+    }
+}

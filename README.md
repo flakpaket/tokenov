@@ -689,6 +689,19 @@ to "approximately" comes from discretizing log-prob to integer levels
 via `ceil(-lp)` — within a single level, output ordering is DFS rather
 than strict rank.)
 
+Each shell emits exactly the candidates whose accumulated level *equals*
+the target, so the shells partition the candidate space with no overlap
+and no gaps. `--count` is therefore a ceiling on that sweep, and
+`--min-level N` is the matching floor: it starts at shell `N`, and its
+stream is an exact suffix of the same run without the flag — same
+candidates, same order, minus the skipped shells. Two hosts can split one
+keyspace with it (host A runs from level 0 to wherever its `--count`
+lands, host B picks up at that level) with no duplicates. What it saves
+is stream volume and downstream cracker time, not generator CPU: the
+skipped low shells are individually the cheap ones. Longer candidates do
+concentrate in the higher shells, but the overlap is wide — pair it with
+`--min-len` when length is what you actually want.
+
 **Parallelization**: domain decomposition by first-level token. In the
 default **fast** mode each thread level-sweeps a disjoint first-level
 subtree and appends its emissions directly to a shared sink in batches (a
@@ -738,6 +751,7 @@ use `--json` to get the machine telemetry stream on stderr without `-v`.
 | `--max-len <N>` | maximum candidate length, post-decode bytes | 30 |
 | `--max-tokens <N>` | maximum tokens per heap-explored path | 12 |
 | `--min-tokens <N>` | minimum tokens per candidate (drop-at-emit floor; 1 = no-op) | 1 |
+| `--min-level <N>` | start the level sweep at shell N, skipping the more-probable shells below it (0 = no-op) | 0 |
 | `--case-shape <SPEC>` | re-case each token (per-slot `?l`/`?c`/`?u`, or `lower`/`cap1`/`title`/`upper`; `;`-separated) | (off) |
 | `--enterprise` | emit only policy-compliant candidates (≥8 chars + ≥3 of 5 classes; capitalize-first repair) | (off) |
 | `--wordlist <PATH>` | OSINT/target wordlist (one entry per line) | (none → standard mode) |
