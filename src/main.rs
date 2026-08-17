@@ -593,7 +593,7 @@ struct GenerateArgs {
     min_tokens: usize,
 
     /// Start enumeration at probability level N, skipping the more-probable
-    /// shells below it. 0 (default) is a no-op.
+    /// levels below it. 0 (default) is a no-op.
     ///
     /// Enumeration walks levels 0, 1, 2, … in order, so --count is a ceiling on
     /// depth and this is the matching floor. The stream is an exact suffix of the
@@ -3145,11 +3145,11 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // position, and its target_level can only sit at or past the floor the run
     // began with (--min-level is part of the fingerprint, which must match). A
     // checkpoint below the floor therefore means a hand-edited or foreign state
-    // file — refuse rather than silently re-emit the skipped shells.
+    // file — refuse rather than silently re-emit the skipped levels.
     if let Some(c) = &strict_ckpt_resume {
         if c.target_level < args.min_level {
             bail!("--resume: checkpoint is at level {} but --min-level is {} — \
-                   resuming it would re-emit shells below the floor",
+                   resuming it would re-emit levels below the floor",
                 c.target_level, args.min_level);
         }
     }
@@ -3554,7 +3554,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             let Some(c) = ck else { continue };
             if c.target_level < args.min_level {
                 bail!("--resume: worker {} checkpoint is at level {} but --min-level is {} — \
-                       resuming it would re-emit shells below the floor",
+                       resuming it would re-emit levels below the floor",
                     i, c.target_level, args.min_level);
             }
         }
@@ -5285,7 +5285,7 @@ fn enumerate_to_sink<F, H>(
     min_tokens: usize,
     min_len: usize,
     max_len: usize,
-    // Floor on the level sweep (`--min-level`): shells below it are never walked,
+    // Floor on the level sweep (`--min-level`): levels below it are never walked,
     // so the stream is an exact suffix of the same run at 0. Ignored when `resume`
     // is Some — the checkpoint's own target_level already sits at or past the floor.
     min_level: u32,
@@ -6738,7 +6738,7 @@ fn do_calibration(
                     // cache here is always populated → CacheMode::Full.
                     &em, &*var, cc, CacheMode::Full, &dt, kind, start_id, end_id,
                     states, max_tokens, 1 /* min_tokens: no filter during calibration */, min_len, max_len,
-                    0, // min_level: calibration always sweeps from shell 0
+                    0, // min_level: calibration always sweeps from level 0
                     thread_target,
                     false, // no enterprise filter during calibration
                     &[],   // no case masks during calibration
