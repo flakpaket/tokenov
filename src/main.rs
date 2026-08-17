@@ -271,7 +271,8 @@ enum Command {
     /// Emit candidates (default if no subcommand is given).
     Generate(GenerateArgs),
     /// Score candidate password(s): report each candidate's Rarity (surprisal,
-    /// in bits) under the model. Reads candidates from args, --file, or stdin.
+    /// in bits) and the enumeration level `generate` would emit it in. Reads
+    /// candidates from args, --file, or stdin.
     Score(ScoreArgs),
     /// Quickstart: fetch a tokenizer + RockYou, then train + register a model.
     Bootstrap(bootstrap::BootstrapArgs),
@@ -5865,10 +5866,12 @@ enum ScoreFormat {
     Table,
     /// Tab-separated: candidate, n_tok, surprisal_bits, surprisal_per_tok_bits,
     /// in_vocab, segmentation, per_pos_surprisal_bits, per_pos_floored (the last
-    /// two comma-joined, one entry per transition incl. the trailing END step).
+    /// two comma-joined, one entry per transition incl. the trailing END step),
+    /// level (`-` if unreachable).
     Tsv,
-    /// One JSON object per line (surprisal_bits/_per_tok in bits; +inf → null).
-    /// Includes a `positions` array of per-transition {label, surprisal_bits, floored}.
+    /// One JSON object per line (surprisal_bits/_per_tok in bits; +inf → null;
+    /// `level` is an integer, or null if unreachable). Includes a `positions`
+    /// array of per-transition {label, surprisal_bits, floored}.
     Jsonl,
 }
 
@@ -5927,6 +5930,14 @@ struct Scored {
     /// True iff fully on the trigram/bigram support (no floor used). In finite
     /// mode a floored candidate is still finite but reports `in_vocab = false`.
     in_vocab: bool,
+    /// Enumeration level of this token path — the pass `generate` emits it in.
+    /// Computed exactly as the enumerator does (`lp_to_level` per transition,
+    /// END step included, summed), so it is directly comparable with
+    /// `--min-level` and with the `level=` on a run's DONE line. `None` when the
+    /// candidate is unreachable (`--reachable` ⇒ `+inf` Rarity). Hypothetical
+    /// whenever `in_vocab` is false: those transitions come from the scorer's
+    /// add-k floor, and the default generator has no such tier to emit them from.
+    level: Option<u32>,
     segmentation: Vec<String>,
     /// One entry per transition (each token, then `END`); surprisals sum to
     /// `surprisal_bits`. Drives the per-position display and per-position floor
@@ -5972,6 +5983,12 @@ fn score_candidate(em: &EnumModel, model: &Model, tokenizer: &Tokenizer, cand: &
     let mut lp = 0f32;
     let mut ok = n_tok > 0;
     let mut floored = false;
+    // Enumeration level, accumulated the way the DFS does it (`main.rs` sweep:
+    // `new_level = frame.acc_level + lp_to_level(child_lp)`) — per-transition
+    // ceiling in nats, summed, END step included. NOT ceil(total surprisal): the
+    // rounding is per step, so the level runs above the joint by up to one per
+    // transition.
+    let mut level: u32 = 0;
     let mut steps: Vec<StepScore> = Vec::with_capacity(n_tok + 1);
     if ok {
         for (i, &t) in ids.iter().enumerate() {
@@ -5987,6 +6004,7 @@ fn score_candidate(em: &EnumModel, model: &Model, tokenizer: &Tokenizer, cand: &
                 }
             };
             lp += step;
+            level += lp_to_level(step);
             steps.push(StepScore { label: segmentation[i].clone(), surprisal_bits: nats_to_bits(step), floored: this_floored });
             a = b;
             b = t;
@@ -5998,8 +6016,8 @@ fn score_candidate(em: &EnumModel, model: &Model, tokenizer: &Tokenizer, cand: &
     // with the generator's emission order, and matches FLA's end-symbol handling).
     if ok {
         match transition_logprob(em, a, b, model.end_id) {
-            Some(step) => { lp += step; steps.push(StepScore { label: "END".into(), surprisal_bits: nats_to_bits(step), floored: false }); }
-            None if finite => { floored = true; let step = floor_step(a, b, model.end_id); lp += step; steps.push(StepScore { label: "END".into(), surprisal_bits: nats_to_bits(step), floored: true }); }
+            Some(step) => { lp += step; level += lp_to_level(step); steps.push(StepScore { label: "END".into(), surprisal_bits: nats_to_bits(step), floored: false }); }
+            None if finite => { floored = true; let step = floor_step(a, b, model.end_id); lp += step; level += lp_to_level(step); steps.push(StepScore { label: "END".into(), surprisal_bits: nats_to_bits(step), floored: true }); }
             None => { ok = false; steps.push(StepScore { label: "END".into(), surprisal_bits: f64::INFINITY, floored: false }); }
         }
     }
@@ -6024,6 +6042,9 @@ fn score_candidate(em: &EnumModel, model: &Model, tokenizer: &Tokenizer, cand: &
         surprisal_bits,
         surprisal_per_tok_bits,
         in_vocab,
+        // Only meaningful when every transition was scored; an unreachable
+        // candidate broke out of the walk with a partial sum.
+        level: if surprisal_bits.is_finite() { Some(level) } else { None },
         segmentation,
         steps,
     }
@@ -6042,6 +6063,15 @@ fn fmt_positional_segmentation(steps: &[StepScore]) -> String {
         parts.push(format!("{}({}{})", st.label, fmt_bits(st.surprisal_bits, 1), star));
     }
     parts.join("|")
+}
+
+/// Enumeration level for the table: `-` when the candidate is unreachable and
+/// there is no pass that would ever emit it.
+fn fmt_level(v: Option<u32>) -> String {
+    match v {
+        Some(l) => l.to_string(),
+        None => "-".to_string(),
+    }
 }
 
 fn fmt_bits(v: f64, prec: usize) -> String {
@@ -6123,17 +6153,18 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                 // Compact columns + the per-position Segment Score breakdown.
                 writeln!(
                     w,
-                    "{:<20} {:>6}  {:>12}  {:<24}  {}",
-                    "Candidate", "Tokens", "Rarity(bits)", "Segmentation", "Segment Score"
+                    "{:<20} {:>6}  {:>12}  {:>5}  {:<24}  {}",
+                    "Candidate", "Tokens", "Rarity(bits)", "Level", "Segmentation", "Segment Score"
                 )?;
                 for c in &candidates {
                     let s = score_candidate(&em, &model, &tokenizer, c, finite, total_unigram);
                     writeln!(
                         w,
-                        "{:<20} {:>6}  {:>12}  {:<24}  {}",
+                        "{:<20} {:>6}  {:>12}  {:>5}  {:<24}  {}",
                         truncate_display(&s.candidate, 20),
                         s.n_tok,
                         fmt_bits(s.surprisal_bits, 1),
+                        fmt_level(s.level),
                         s.segmentation.join("|"),
                         fmt_positional_segmentation(&s.steps)
                     )?;
@@ -6143,17 +6174,18 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                 // per-position Segment Score column.
                 writeln!(
                     w,
-                    "{:<20} {:>6}  {:>12}  {}",
-                    "Candidate", "Tokens", "Rarity(bits)", "Segmentation"
+                    "{:<20} {:>6}  {:>12}  {:>5}  {}",
+                    "Candidate", "Tokens", "Rarity(bits)", "Level", "Segmentation"
                 )?;
                 for c in &candidates {
                     let s = score_candidate(&em, &model, &tokenizer, c, finite, total_unigram);
                     writeln!(
                         w,
-                        "{:<20} {:>6}  {:>12}  {}",
+                        "{:<20} {:>6}  {:>12}  {:>5}  {}",
                         truncate_display(&s.candidate, 20),
                         s.n_tok,
                         fmt_bits(s.surprisal_bits, 1),
+                        fmt_level(s.level),
                         s.segmentation.join("|")
                     )?;
                 }
@@ -6164,9 +6196,11 @@ fn run_score(args: ScoreArgs) -> Result<()> {
             // trailing END step) — so they have n_tok+1 entries; the last is END.
             // per_pos_surprisal_bits sums to surprisal_bits; per_pos_floored is
             // 0/1 flags marking off-support (floored) steps.
+            // `level` is appended last so column indices 0..7 stay where any
+            // existing consumer expects them.
             writeln!(
                 w,
-                "candidate\tn_tok\tsurprisal_bits\tsurprisal_per_tok_bits\tin_vocab\tsegmentation\tper_pos_surprisal_bits\tper_pos_floored"
+                "candidate\tn_tok\tsurprisal_bits\tsurprisal_per_tok_bits\tin_vocab\tsegmentation\tper_pos_surprisal_bits\tper_pos_floored\tlevel"
             )?;
             for c in &candidates {
                 let s = score_candidate(&em, &model, &tokenizer, c, finite, total_unigram);
@@ -6174,7 +6208,7 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                 let per_pos_floored = s.steps.iter().map(|st| if st.floored { "1" } else { "0" }).collect::<Vec<_>>().join(",");
                 writeln!(
                     w,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     s.candidate,
                     s.n_tok,
                     fmt_bits(s.surprisal_bits, 4),
@@ -6182,7 +6216,8 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                     s.in_vocab,
                     s.segmentation.join("|"),
                     per_pos_bits,
-                    per_pos_floored
+                    per_pos_floored,
+                    fmt_level(s.level)
                 )?;
             }
         }
@@ -6210,12 +6245,13 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                     .join(",");
                 writeln!(
                     w,
-                    "{{\"candidate\":{},\"n_tok\":{},\"surprisal_bits\":{},\"surprisal_per_tok_bits\":{},\"in_vocab\":{},\"segmentation\":[{}],\"positions\":[{}]}}",
+                    "{{\"candidate\":{},\"n_tok\":{},\"surprisal_bits\":{},\"surprisal_per_tok_bits\":{},\"in_vocab\":{},\"level\":{},\"segmentation\":[{}],\"positions\":[{}]}}",
                     json_str(&s.candidate),
                     s.n_tok,
                     json_num(s.surprisal_bits),
                     json_num(s.surprisal_per_tok_bits),
                     s.in_vocab,
+                    s.level.map(|l| l.to_string()).unwrap_or_else(|| "null".into()),
                     seg,
                     positions
                 )?;

@@ -221,7 +221,7 @@ The CLI is grouped into noun-commands. `tokenov --help` lists them; each group
 | `tokenov tokenizer` | list tokenizers + download status (bare); `get`/`add`/`delete`/`train`/`set-default` verbs |
 | `tokenov model` | list registered models (bare); `train`/`register`/`delete`/`info`/`verify` verbs |
 | `tokenov generate` | emit candidates (also the default if no subcommand is given) |
-| `tokenov score` | report each candidate's Rarity (surprisal, in bits) under the model |
+| `tokenov score` | report each candidate's Rarity (surprisal, in bits) and enumeration level under the model |
 
 > The old flat names still work as hidden aliases — `tokenov build` →
 > `tokenov model train`, `tokenov fetch` → `tokenov tokenizer get`, plus
@@ -524,17 +524,19 @@ tokenov score 123456 password correcthorsebatterystaple 'Tr0ub4dour&3'
 ```
 
 ```
-Candidate            Tokens  Rarity(bits)  Segmentation
-123456                    3           7.0  12|34|56
-password                  1           9.1  password
-correcthorsebattery…      6          92.8  correct|horse|b|attery|st|aple
-Tr0ub4dour&3              8          87.9  Tr|0|ub|4|d|our|&|3
+Candidate            Tokens  Rarity(bits)  Level  Segmentation
+123456                    3           7.0      7  12|34|56
+password                  1           9.1      7  password
+correcthorsebattery…      6          92.8     68  correct|horse|b|attery|st|aple
+Tr0ub4dour&3              8          87.9     67  Tr|0|ub|4|d|our|&|3
 ```
 
 The columns: `Tokens` is the token count, `Rarity(bits)` the joint surprisal
-(`-log2 P(candidate)` in bits; higher = rarer = stronger), and `Segmentation`
-the plain token split (`hack|the|planet`). Long candidates are truncated in the
-first column only; the full split still shows in `Segmentation`.
+(`-log2 P(candidate)` in bits; higher = rarer = stronger), `Level` the
+enumeration pass `generate` emits this candidate in (see below), and
+`Segmentation` the plain token split (`hack|the|planet`). Long candidates are
+truncated in the first column only; the full split still shows in
+`Segmentation`.
 
 Pass **`-d` / `--detailed`** to add a per-position `Segment Score` column:
 
@@ -543,10 +545,10 @@ tokenov score -d 123456 correcthorsebatterystaple 'Tr0ub4dour&3'
 ```
 
 ```
-Candidate            Tokens  Rarity(bits)  Segmentation              Segment Score
-123456                    3           7.0  12|34|56                  START|12(5.3)|34(0.6)|56(0.5)|END(0.6)
-correcthorsebattery…      6          92.8  correct|horse|b|attery|st|aple  START|correct(18.4)|horse(20.5*)|b(10.1)|attery(14.9)|st(15.9*)|aple(12.0)|END(0.9)
-Tr0ub4dour&3              8          87.9  Tr|0|ub|4|d|our|&|3       START|Tr(14.6)|0(6.8)|ub(5.9)|4(7.7)|d(9.0)|our(16.8)|&(16.9*)|3(8.8)|END(1.5)
+Candidate            Tokens  Rarity(bits)  Level  Segmentation              Segment Score
+123456                    3           7.0      7  12|34|56                  START|12(5.3)|34(0.6)|56(0.5)|END(0.6)
+correcthorsebattery…      6          92.8     68  correct|horse|b|attery|st|aple  START|correct(18.4)|horse(20.5*)|b(10.1)|attery(14.9)|st(15.9*)|aple(12.0)|END(0.9)
+Tr0ub4dour&3              8          87.9     67  Tr|0|ub|4|d|our|&|3       START|Tr(14.6)|0(6.8)|ub(5.9)|4(7.7)|d(9.0)|our(16.8)|&(16.9*)|3(8.8)|END(1.5)
 ```
 
 `Segment Score` is the **per-position breakdown** — `START` anchor, then each
@@ -581,6 +583,32 @@ because the tokenizer's single greedy segmentation may differ from the
 path the enumerator took, and Rarity does not marginalize over alternative
 segmentations of the same string.
 
+**Level, and why it isn't the Rarity number.** `Level` is the enumeration pass
+`generate` emits the candidate in — the number to hand to `--min-level`. It is
+computed exactly the way the enumerator computes it, which is *not* a rounding
+of the Rarity figure next to it. Two things differ:
+
+- **Unit.** Rarity is bits (`−log₂ P`); levels are nats (`−ln P`). One nat is
+  1.4427 bits, so 92.8 bits of Rarity is 64.3 nats.
+- **Rounding.** The level is not one rounding of the total. Each transition's
+  cost is rounded **up** on its own and the results are summed (the `END`
+  transition included), so a candidate with `k` tokens has been rounded up `k+1`
+  times and its level sits *above* the nats total by up to that much.
+
+So `level ≈ ceil(rarity_bits / 1.4427)`, plus up to one per transition —
+`correcthorsebatterystaple` above is 92.8 bits = 64.3 nats over 7 transitions,
+and lands at level 68. Rarity and level order candidates near-identically, but
+neither converts cleanly into the other.
+
+Two caveats. A candidate with a floored step (`in_vocab: false`) still gets a
+level, but it is hypothetical: that step's probability came from the scorer's
+add-k floor, and `generate` has no such tier to emit it from. And the level is
+the level of the candidate's *greedy* segmentation — the enumerator may reach
+the same string by a different token path with a different level, the same
+caveat that already applies to Rarity. An unreachable candidate
+(`--reachable`, Rarity `+inf`) reports no level at all: `-` in the table, `null`
+in `jsonl`.
+
 **Floored steps, and when Rarity is `+inf`.** A token transition the trigram
 *and* the KN bigram-continuation tier both lack mass for is off-support. By
 default, `score` backs such a step off to a full-vocab add-k unigram floor so
@@ -598,14 +626,16 @@ the finite default is the everyday strength-meter view.
   display only. Shows a plain `Segmentation` column; `-d`/`--detailed` adds a
   `Segment Score` column with the per-position bits + `*` floor markers.
 - `tsv` — `candidate, n_tok, surprisal_bits, surprisal_per_tok_bits, in_vocab,
-  segmentation, per_pos_surprisal_bits, per_pos_floored`. The last two are
-  comma-joined, one entry per transition (each token, then the trailing `END`
-  step, so they hold `n_tok + 1` entries); `per_pos_surprisal_bits` sums to
-  `surprisal_bits`. Columns use the precise term *surprisal* (Rarity is the same
-  number); untruncated; feed straight into pandas/awk.
-- `jsonl` — one JSON object per line, same scalar fields plus a `positions`
-  array of per-transition `{label, surprisal_bits, floored}`; `+inf` is emitted
-  as `null` so it parses. For analysis pipelines (e.g. studying whether a Rarity
+  segmentation, per_pos_surprisal_bits, per_pos_floored, level`.
+  `per_pos_surprisal_bits` and `per_pos_floored` are comma-joined, one entry per
+  transition (each token, then the trailing `END` step, so they hold `n_tok + 1`
+  entries); `per_pos_surprisal_bits` sums to `surprisal_bits`. `level` is last,
+  so the column indices that existed before it stay put; it is `-` for an
+  unreachable candidate. Columns use the precise term *surprisal* (Rarity is the
+  same number); untruncated; feed straight into pandas/awk.
+- `jsonl` — one JSON object per line, same scalar fields (including `level`, an
+  integer or `null`) plus a `positions` array of per-transition
+  `{label, surprisal_bits, floored}`; `+inf` is emitted as `null` so it parses. For analysis pipelines (e.g. studying whether a Rarity
   threshold predicts crackability).
 
 ```bash
