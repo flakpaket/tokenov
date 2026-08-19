@@ -28,6 +28,11 @@ pub struct EnumModel {
     /// Variant B/E: top-K entries from a unigram backoff distribution.
     /// Empty for Variant A (no unigram tier).
     pub unigram_top: Vec<(u32, f32)>,
+    /// Log-weight applied to unigram-tier emissions, on top of log_lambda(a, b).
+    /// Set from `--unigram-tail [FRACTION]` (ln of the fraction); defaults to
+    /// ln(0.1) — the tier gets 10% of the bigram tier's missing-mass budget.
+    /// Unused by variants without a unigram tier.
+    pub unigram_logw: f32,
     /// Start-of-sequence sentinel token id. Variants that need to detect
     /// the start context (e.g., Variant E for start-position-only case
     /// expansion) read this. Set by `Variant::prepare`.
@@ -47,7 +52,7 @@ pub trait Variant: Send + Sync {
 
     /// Build the runtime `EnumModel` from the saved `Model`. Variant-specific
     /// fields (e.g. `unigram_top`) are populated here.
-    fn prepare(&self, model: &Model) -> EnumModel;
+    fn prepare(&self, model: &Model, unigram_logw: f32) -> EnumModel;
 
     /// Return the children to emit for context (a, b). The returned vec is
     /// sorted descending by log-prob. Per-context cap is variant-specific.

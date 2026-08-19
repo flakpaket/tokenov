@@ -14,7 +14,7 @@ pub struct A;
 impl Variant for A {
     fn name(&self) -> &'static str { "baseline" }
 
-    fn prepare(&self, model: &Model) -> EnumModel {
+    fn prepare(&self, model: &Model, unigram_logw: f32) -> EnumModel {
         let mut trigram: FxHashMap<Ctx, Vec<(u32, f32)>> = FxHashMap::default();
         trigram.reserve(model.contexts.len());
         for (&ctx, (ids, cum)) in &model.contexts {
@@ -36,6 +36,7 @@ impl Variant for A {
                 bigram: FxHashMap::default(),
                 log_lambda: FxHashMap::default(),
                 unigram_top: Vec::new(),
+                unigram_logw,
                 start_id: model.start_id,
             };
         }
@@ -66,6 +67,7 @@ impl Variant for A {
             bigram,
             log_lambda,
             unigram_top: Vec::new(),
+            unigram_logw,
             start_id: model.start_id,
         }
     }

@@ -724,11 +724,28 @@ struct GenerateArgs {
     #[arg(long, value_name = "FILE", help_heading = "Resume & checkpointing")]
     resume_state: Option<PathBuf>,
 
+    /// Add the unigram tail: also consider the most frequent tokens overall at
+    /// every step, not just tokens seen in this context.
+    ///
+    /// The tail lets tokenov reach candidates its context statistics alone can't
+    /// (`oatmeal77` when `77` never followed `oatmeal` in training). Tail
+    /// entries are weighted below the context tiers so they surface once the
+    /// better options at a level are spent — they are NOT a fallback tier that
+    /// only fires when the others run dry.
+    ///
+    /// Bare `--unigram-tail` uses the default weight. Pass a FRACTION to change
+    /// how strongly it fires: the fraction of the bigram tier's missing-mass
+    /// budget the tail receives. Higher = tail candidates surface earlier and
+    /// more often; 0.1 is the default.
+    #[arg(long, value_name = "FRACTION", num_args = 0..=1,
+          default_missing_value = "0.1", help_heading = "Generation")]
+    unigram_tail: Option<f32>,
+
     /// Algorithm variant (experimental). Default `baseline`.
     ///
     ///   baseline   — trigram + Kneser-Ney bigram backoff (the default)
-    ///   freq-tail  — baseline plus a raw-frequency unigram backoff tail
-    ///   cap-tail   — baseline plus a capital-biased unigram backoff tail
+    ///   freq-tail  — DEPRECATED spelling of `--unigram-tail`
+    ///   cap-tail   — unigram tail ranked by case group (unproven; hidden)
     #[arg(long, default_value = "baseline", hide = true)]
     variant: String,
 
@@ -2791,9 +2808,39 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         // clap derive; we treat any --mode without --wordlist as benign.)
     }
 
-    // Resolve the algorithm variant from the --variant flag.
-    let variant = variant::dispatch(&args.variant)?;
-    log_msg(&format!("[gen] variant: {}", variant.name()));
+    // Resolve the algorithm from --unigram-tail / --variant. `--unigram-tail`
+    // is the supported spelling; `--variant freq-tail` is kept working (it is in
+    // existing scripts) but warns. Weight is given as a FRACTION of the bigram
+    // tier's missing-mass budget and converted to the log-space value the tail
+    // actually applies, so nobody has to type a negative logarithm.
+    let variant_name: String = match (args.unigram_tail, args.variant.as_str()) {
+        (Some(_), "cap-tail") | (Some(_), "e") =>
+            bail!("--unigram-tail and --variant cap-tail both set a unigram tail; pick one"),
+        (Some(_), v) if v != "baseline" && v != "a" && v != "freq-tail" && v != "b" =>
+            bail!("--unigram-tail cannot be combined with --variant {}", v),
+        (Some(_), _) => "freq-tail".to_string(),
+        (None, "freq-tail") | (None, "b") => {
+            deprecate("generate --variant freq-tail", "generate --unigram-tail");
+            warn_msg("  (--unigram-tail also takes an optional weight, e.g. --unigram-tail 0.3)");
+            "freq-tail".to_string()
+        }
+        (None, v) => v.to_string(),
+    };
+    let unigram_logw: f32 = match args.unigram_tail {
+        None => crate::variant_b::LOG_LAMBDA_BIGRAM,
+        Some(f) if f <= 0.0 || !f.is_finite() =>
+            bail!("--unigram-tail FRACTION must be > 0 (got {}); omit the flag to disable the tail", f),
+        Some(f) => {
+            if f > 1.0 {
+                warn_msg(&format!("warning: --unigram-tail {} weights the unigram tail above the \
+                                   bigram tier's whole missing-mass budget", f));
+            }
+            f.ln()
+        }
+    };
+    let variant = variant::dispatch(&variant_name)?;
+    log_msg(&format!("[gen] variant: {} (unigram tail weight {:.3} = ln {:.4})",
+        variant.name(), unigram_logw.exp(), unigram_logw));
 
     let model_path = match &args.model {
         Some(p) => registry::resolve_model(p)?,  // accept a registered name or a path
@@ -2930,7 +2977,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             (m, Some(entry_seqs), w_set)
         }
     };
-    let mut enum_model = variant.prepare(&post_bias_model);
+    let mut enum_model = variant.prepare(&post_bias_model, unigram_logw);
 
     // Seed-chunk graft generator: the DEFAULT for --wordlist (unless a
     // legacy --mode was requested, or --append-only). A self-contained path that
@@ -6024,7 +6071,7 @@ fn run_score(args: ScoreArgs) -> Result<()> {
     let model = model_load(&model_path)?;
     let tokenizer = load_wordlist_tokenizer(&model_path, args.model.is_none())?;
     let variant = variant::dispatch(&args.variant)?;
-    let em = variant.prepare(&model);
+    let em = variant.prepare(&model, crate::variant_b::LOG_LAMBDA_BIGRAM);
     // Full-vocab add-k unigram floor: finite scoring unless --reachable, and only
     // when the model actually carries unigram counts (NGRMv002).
     let total_unigram: f64 = model.unigram_raw.iter().map(|&c| c as f64).sum();
@@ -6576,7 +6623,7 @@ fn do_calibration(
             // shape matches.
             let mut model = model_load(model_path)?;
             let kind  = guess_kind_from_decode(&model.decode);
-            let mut enum_model = variant.prepare(&model);
+            let mut enum_model = variant.prepare(&model, crate::variant_b::LOG_LAMBDA_BIGRAM);
             // Drop model heavy fields immediately after prepare.
             model.contexts = rustc_hash::FxHashMap::default();
             model.bigram_kn = rustc_hash::FxHashMap::default();

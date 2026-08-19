@@ -57,10 +57,10 @@ fn case_collapse(bytes: &[u8]) -> Vec<u8> {
 impl Variant for E {
     fn name(&self) -> &'static str { "cap-tail" }
 
-    fn prepare(&self, model: &Model) -> EnumModel {
+    fn prepare(&self, model: &Model, unigram_logw: f32) -> EnumModel {
         // Trigram + bigram + log_lambda are identical to Variant A. Reuse
         // by delegating; v5 does not modify the head tiers.
-        let mut em = crate::variant_a::A.prepare(model);
+        let mut em = crate::variant_a::A.prepare(model, unigram_logw);
 
         let total_unigram: u64 = model.unigram_raw.iter().sum();
         if total_unigram == 0 {
@@ -173,7 +173,7 @@ impl Variant for E {
                 for &(id, lp_uni) in &em.unigram_top {
                     if n >= MAX_UNIGRAM_BACKOFF_CHILDREN { break; }
                     if !tri_seen.contains(&id) && !bi_seen.contains(&id) {
-                        out.push((id, log_lam_ab + LOG_LAMBDA_BIGRAM + lp_uni));
+                        out.push((id, log_lam_ab + em.unigram_logw + lp_uni));
                         n += 1;
                     }
                 }
