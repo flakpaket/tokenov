@@ -10,3 +10,6 @@ target/
 # Private, local-only engineering tracker (see issues/README.md). Working notes, not
 # user documentation — never published with the crate or the repo.
 issues/
+
+# Local-only Claude Code project instructions. Working guidance, not shipped docs.
+CLAUDE.md
