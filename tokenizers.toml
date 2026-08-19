@@ -33,17 +33,17 @@ default_alias = "tokenov_v1"
 [[tokenizer]]
 alias = "tokenov_v1"
 url = "bundled:tokenov_v1"
-note = "Tokenov tokenizer v1 — the shipped default. OpenAI GPT-2 (MIT) vocab + a \\p{N}{1,2} digit pre-tokenizer (Phase-18 winner). Bundled in the binary; needs no network."
+note = "Tokenov tokenizer v1 — the shipped default. OpenAI GPT-2 (MIT) vocab + a \\p{N}{1,2} digit pre-tokenizer. Bundled in the binary; needs no network."
 
 [[tokenizer]]
 alias = "llama3"
 url = "https://huggingface.co/unsloth/llama-3-8b/resolve/main/tokenizer.json"
-note = "LLaMA-3 (128K). Project headline tokenizer. unsloth mirror of gated meta-llama/Meta-Llama-3-8B."
+note = "LLaMA-3 (128K byte-level BPE). unsloth mirror of gated meta-llama/Meta-Llama-3-8B."
 
 [[tokenizer]]
 alias = "qwen25_7b"
 url = "https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/tokenizer.json"
-note = "Qwen2.5 (~152K, byte-level BPE/tiktoken). Default bootstrap tokenizer — the project's qwen champion. Ungated."
+note = "Qwen2.5 (~152K, byte-level BPE/tiktoken). Ungated."
 
 [[tokenizer]]
 alias = "gpt2"
