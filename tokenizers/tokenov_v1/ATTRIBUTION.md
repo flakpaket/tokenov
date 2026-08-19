@@ -21,25 +21,23 @@ A **derivative of OpenAI GPT-2**:
 
 ## Why this tokenizer
 
-Phase-18 of the password_research project benchmarked it as the strongest
-**non-Chinese, license-clean** token alphabet for the tokenov n-gram cracker: at a
-1e9-candidate budget it beats stock LLaMA-3 by **+3.22 pts** (mean over 16 corpora,
-raw) and edges the `llama3_d12` reference by +0.46. The `\p{N}{1,2}` digit
-granularity is the lever — it lets the trigram model compose year/date suffixes
-(`whales|20|07`) instead of diluting them across single digits. Full writeup:
-`password_research/docs/findings/phase18_license_clean_default_tokenizer.md`.
+It benchmarked as the strongest license-clean token alphabet for the tokenov
+n-gram cracker: at a 1e9-candidate budget it beats stock LLaMA-3 by **+3.22 pts**
+(mean over 16 corpora, no rules) and edges an equivalent LLaMA-3 digit variant by
++0.46. The `\p{N}{1,2}` digit granularity is the lever — it lets the trigram model
+compose year/date suffixes (`whales|20|07`) instead of diluting them across single
+digits.
 
 ## How to regenerate
 
-```
-uv run password_research/scripts/build_digit_variant.py gpt2 --prepend
-# -> outputs/vocabularies/hf_tokenizers/gpt2_d12/tokenizer.json  (copied here)
-```
+Take the upstream `openai-community/gpt2` `tokenizer.json` and prepend a
+`Split` pre-tokenizer on the pattern `\p{N}{1,2}` (invert off, `isolated`
+behavior), keeping the existing `ByteLevel` pre-tokenizer after it. Everything
+else — vocab, merges, decoder, post-processor — is copied through unchanged.
 
 ## License note
 
 GPT-2 and its tokenizer are MIT-licensed by OpenAI; redistributing this derivative
-is permitted under MIT (retain the MIT notice). **The formal license text / SPDX
-sidecar for this bundled file, and tokenov's own code-license choice, are being
-finalized separately** — see `password_research/issues/issue-015-*`. This file
-records attribution; it is not itself the license grant.
+is permitted under MIT (retain the MIT notice). tokenov's own code is Apache-2.0
+(see `LICENSE`). This file records attribution for the bundled tokenizer; it is
+not itself the license grant.
