@@ -12,6 +12,25 @@ than ASCII characters) is what makes the output structurally diverse —
 multi-class strings like `Stamford12`, `Bella-boo`, `KOOL-AID5` appear in
 the head of the distribution rather than as low-probability tail events.
 
+## Quick start — Install & Bootstrap
+
+Tokenov is available on crates.io and can be installed with `cargo`. To install
+Rust and Cargo, check out https://rust-lang.org/tools/install/. Once you have
+Rust and Cargo, simply run:
+
+```bash
+cargo install tokenov
+tokenov bootstrap
+```
+
+After you've installed Tokenov and run `tokenov bootstrap`, you're ready to
+generate candidates:
+
+```bash
+tokenov generate --count 10   # Test run to generate ~10 candidates
+tokenov | hashcat -a 0 ...    # Pipe candidates to Hashcat stdin
+```
+
 ## Build
 
 ```bash
@@ -22,193 +41,6 @@ cargo build --release
 ```
 
 Requires Rust ≥ 1.85 (2024 edition).
-
-## Quick start — zero to candidates
-
-**The one-command path.** `tokenov bootstrap` does everything below for you —
-uses its **bundled default tokenizer** (`tokenov_v1`, embedded in the binary, no
-download), downloads + frequency-expands RockYou, then trains and registers a
-model:
-
-```bash
-tokenov bootstrap --dry-run   # preview the plan + equivalent manual commands
-tokenov bootstrap             # run it; ends with a registered model
-tokenov generate --count 10   # Test run to generate 10 candidates
-tokenov | hashcat -a 0 ...    # Pipe candidates to Hashcat stdin
-```
-
-## Inputs you'll need
-
-### A tokenizer
-
-**You don't need to fetch one yourself.** tokenov ships a bundled default
-tokenizer (`tokenov_v1`, embedded in the binary — no download, works offline)
-plus a built-in manifest of ungated aliases it can download for you, no
-HuggingFace auth token required:
-
-```bash
-tokenov tokenizer                       # list every alias + download status
-tokenov tokenizer get gpt2 --dest .     # → ./gpt2/tokenizer.json
-tokenov tokenizer get --all             # fetch them all
-```
-
-Bundled aliases include `tokenov_v1` (the offline default), `gpt2`, `llama3`,
-`qwen25_7b`, `mistral7b`, `falcon7b`, `gemma2_2b`, and more — run `tokenov
-tokenizer` for the full list. You can also add your own
-(`tokenov tokenizer add <alias> <url|file> "note"`) or train one from a
-password corpus (`tokenov tokenizer train`). Most workflows never touch a
-tokenizer file directly: `tokenov bootstrap` and `generate` use the bundled
-default, and a trained model embeds its tokenizer.
-
-**Bring your own.** tokenov also consumes any HuggingFace `tokenizer.json`
-directly — fetch it however you like (`hf download gpt2 tokenizer.json
---local-dir ./tokenizers/gpt2`, or `AutoTokenizer.save_pretrained(...)`) and
-point `--tokenizer` at the file.
-
-Tokenov will work with any HF tokenizer, but be aware that:
-
-- **WordPiece** tokenizers (BERT) emit subword tokens with `##` prefixes that
-  appear in decoded output; you may need to filter the vocab before training.
-- **SentencePiece** tokenizers (e.g. Mistral) prepend `▁` (U+2581) to
-  word-initial tokens; tokenov decodes these correctly to spaces.
-- Tokenizers trained on non-English text will produce candidates in those
-  scripts.
-
-### A training corpus (password list)
-
-The model learns an n-gram distribution from a list of plaintext passwords
-(one per line, UTF-8). Common sources:
-
-- **[SecLists](https://github.com/danielmiessler/SecLists)** —
-  `Passwords/Leaked-Databases/rockyou.txt.tar.gz` is the canonical RockYou
-  leak (~14M unique passwords). Most password-cracking research uses this
-  as the training set.
-- **[weakpass.com](https://weakpass.com/wordlists)** — curated wordlists
-  derived from many breaches.
-- **Your own breach data** — for OSINT-aware engagements, train on a leak
-  closer to your target population if available.
-
-For experimentation, RockYou is the standard:
-
-```bash
-git clone --depth 1 https://github.com/danielmiessler/SecLists
-tar xf SecLists/Passwords/Leaked-Databases/rockyou.txt.tar.gz -C ./data/
-# wordlist now at ./data/rockyou.txt (~140 MB, ~14M entries)
-```
-
-### (Optional) An OSINT wordlist for targeted attacks
-
-For wordlist-targeting modes (`--wordlist`), provide a small file
-(typically 5-100 entries) with target-relevant terms — employee names,
-project codenames, brand words, location names, etc. One entry per line.
-
-```text
-# example: healthcare_seeds.txt — industry/region terms, not a real org
-healthcare
-hospital
-clinic
-patient
-nurse
-pharma
-cardio
-radiology
-telehealth
-wellness
-medicaid
-hipaa
-```
-
-## Manual setup and configuration
-
-The manual walkthrough below does the same steps explicitly. It is fully
-self-contained: nothing but the built `tokenov` binary, runs in seconds, and
-downloads ~1.3 MB. Every path is one you create in an earlier step.
-
-```bash
-# 0. Point at the binary you built above.
-TOKENOV=/path/to/tokenov/target/release/tokenov
-
-# 1. Get a tokenizer.json. Easiest is tokenov's built-in fetcher (no HF auth):
-$TOKENOV tokenizer get gpt2 --dest .
-# → ./gpt2/tokenizer.json
-#   (list available aliases with `$TOKENOV tokenizer`; or download any HF
-#    tokenizer.json yourself, e.g. `hf download gpt2 tokenizer.json --local-dir .`)
-
-# 2. Make a tiny training corpus (one password per line). For a real
-#    attack swap this for a leak like RockYou — see step 2b below.
-printf '%s\n' password 123456 password1 letmein qwerty Summer2020 \
-    dragon123 iloveyou monkey master Spring2021 hello123 superman \
-    princess sunshine football welcome admin123 Bella-boo KOOL-AID5 \
-    Stamford12 baseball shadow michael > train.txt
-
-# 3. Fit the n-gram Markov model. These three flags are the full minimum.
-$TOKENOV model train \
-    --tokenizer ./gpt2/tokenizer.json \
-    --train ./train.txt \
-    --output ./model.ngram
-# → ./model.ngram
-
-# 4. Generate candidates (approximately rank-ordered). Minimal: model +
-#    count + output. No --threads (auto-detected), no chunk-size tuning.
-$TOKENOV generate \
-    --model ./model.ngram \
-    --count 1000 \
-    --output ./candidates.txt
-# → ./candidates.txt
-```
-
-What you'll see: `head candidates.txt` shows password-like lines
-(`Bella-boo`, `KOOL-AID5`, `Summer2020`, `admin123` …) — multi-class
-strings appear in the *head* of the distribution, which is the whole point
-of using tokens instead of characters. The toy 24-line corpus exhausts its
-keyspace at ~31 candidates even though you asked for 1000; that's expected
-for a tiny list. A real training list emits billions of unique candidates
-before exhausting.
-
-**2b. Use a real wordlist.** For an actual attack, replace `train.txt`
-with a breach corpus. RockYou is the research standard:
-
-```bash
-git clone --depth 1 https://github.com/danielmiessler/SecLists
-tar xf SecLists/Passwords/Leaked-Databases/rockyou.txt.tar.gz -C .
-# now build with --train ./rockyou.txt instead (~14M passwords; build is ~25–75s)
-```
-
-Or just run `tokenov bootstrap`, which downloads RockYou and frequency-expands
-it (each password repeated by its real count) into a ready-to-train corpus — a
-frequency-weighted training list rather than the flat deduped `rockyou.txt` —
-then trains and registers the model in one step.
-
-**Use the candidates** as a hashcat wordlist, or pipe them straight in:
-
-```bash
-hashcat -a 0 -m 0 hashes.txt ./candidates.txt
-# or, no intermediate file (multithreaded stdout works):
-$TOKENOV generate --model ./model.ngram --count 1000000000 | hashcat -a 0 -m 0 hashes.txt
-```
-
-**Compression at rest.** Tokenov writes plain UTF-8 text by design (so
-`--resume` and stdout piping work) — it never compresses its own output.
-If you want candidates compressed on disk, run it as a separate post-step:
-
-```bash
-7z a -mx=1 candidates.7z candidates.txt && rm candidates.txt
-```
-
-**Side effect of training.** Every `model train` registers the model in
-`~/.config/tokenov/models.toml` so `tokenov model` (list) can find it later,
-and `generate --model <name>` resolves it by name. If you omit `--output`, the
-model is written to the default store
-(`$XDG_DATA_HOME/tokenov/models/<name>.ngram`, else
-`~/.local/share/tokenov/models/<name>.ngram`) under the tokenizer's
-basename. Passing `--output` (as above) keeps the file in your working
-directory; the registry entry is still written either way.
-
-Throughput is hardware-dependent and scales roughly with vocab size (the
-decode table and per-candidate byte payloads grow with it) — see the build
-table under `tokenov model train` below for the relative cost of each tokenizer.
-For a real 10⁹-candidate run, just omit `--threads` and let tokenov use all
-detected cores.
 
 ## Subcommands
 
@@ -226,6 +58,21 @@ The CLI is grouped into noun-commands. `tokenov --help` lists them; each group
 > The old flat names still work as hidden aliases — `tokenov build` →
 > `tokenov model train`, `tokenov fetch` → `tokenov tokenizer get`, plus
 > `delete`/`register` — but print a deprecation notice. Prefer the new forms.
+
+### `tokenov bootstrap`
+
+Zero-input quickstart: use the **bundled default tokenizer** (`tokenov_v1`,
+embedded in the binary — no download), download + frequency-expand RockYou, then
+`model train` + register. Prints a plan (with copy-pasteable manual commands) and
+proceeds.
+
+```bash
+tokenov bootstrap --dry-run    # preview only; no network or writes
+tokenov bootstrap              # → registers the default model `tokenov_v1`
+```
+
+> The bootstrap model trains on the **full** RockYou (no train/test split) — a
+> get-running convenience, not for measuring crack rates.
 
 ### `tokenov model train`
 
@@ -259,6 +106,12 @@ Inspect a model's embedded provenance:
 tokenov model info model.ngram      # tokenizer, train corpus, build time, version
 ```
 
+Every `model train` registers the model in `~/.config/tokenov/models.toml`, so
+`tokenov model` lists it and `generate --model <name>` resolves it by name. With
+`--output` the file stays where you put it; omit `--output` and it lands in the
+default store (`$XDG_DATA_HOME/tokenov/models/<name>.ngram`, else
+`~/.local/share/tokenov/models/<name>.ngram`).
+
 Build times for typical configs on RockYou-train (14.2M passwords):
 
 | tokenizer | vocab | model size | build time |
@@ -281,6 +134,14 @@ tokenov tokenizer add mybert <url|file> "note"   # add your own alias
 tokenov tokenizer delete mybert         # remove a download (+ user-added entry)
 tokenov tokenizer set-default gpt2      # change the default tokenizer/model
 ```
+
+**Bring your own.** tokenov also consumes any HuggingFace `tokenizer.json`
+directly — point `--tokenizer` at the file. Two shapes to know about: WordPiece
+tokenizers (BERT) emit `##`-prefixed subwords that show up in decoded output (you
+may want to filter the vocab before training), and SentencePiece tokenizers (e.g.
+Mistral) prepend `▁` (U+2581) to word-initial tokens, which tokenov decodes to
+spaces. A tokenizer trained on non-English text produces candidates in that
+script.
 
 **Train your own tokenizer** (`tokenizer train`) fits a byte-level **BPE** over a
 password corpus and writes a standard `tokenizer.json` — closing the loop so you can
@@ -318,21 +179,6 @@ default. Attribution + provenance:
 (Existing installs keep whatever `default_alias` their user manifest already has;
 only fresh installs pick `tokenov_v1` automatically.)
 
-### `tokenov bootstrap`
-
-Zero-input quickstart that chains the above: use the **bundled default tokenizer**
-(`tokenov_v1`, embedded in the binary — no download), download + frequency-expand
-RockYou, then `model train` + register. Prints a plan (with copy-pasteable manual
-commands) and proceeds.
-
-```bash
-tokenov bootstrap --dry-run    # preview only; no network or writes
-tokenov bootstrap              # → registers the default model `tokenov_v1`
-```
-
-> The bootstrap model trains on the **full** RockYou (no train/test split) — a
-> get-running convenience, not for measuring crack rates.
-
 ### `tokenov generate`
 
 Emits candidate passwords. Default subcommand if none is specified. `--model`
@@ -355,7 +201,9 @@ tokenov generate --model model.ngram --count 1000000000 --output cands.txt
 ```
 
 **Wordlist-targeting mode** (with `--wordlist`): roots generation at your
-OSINT-derived seeds and grows Markov continuations from them. By **default** each
+OSINT-derived seeds and grows Markov continuations from them. The seed file is a
+small list (typically 5–100 entries, one per line) of target-relevant terms —
+employee names, project codenames, brand words, locations. By **default** each
 seed keeps its place as the prefix and affixes are **appended** (`cisco` →
 `cisco2024`) — the common shape for OSINT seeds. Affix placement:
 
