@@ -488,7 +488,7 @@ Passing them to `generate` warns and changes nothing; they apply to the
 hidden `calibrate` subcommand only.
 
 The knob that *is* live in fast mode is **`--flush-bytes`** (hidden, default
-262144): how many bytes a worker buffers before taking the shared output
+65536): how many bytes a worker buffers before taking the shared output
 lock. Smaller means a finer interleave between partitions — output closer to
 rank order — larger means fewer lock acquisitions. Throughput is flat across
 the usable range because the sink's 8 MiB `BufWriter` already amortizes the
@@ -764,7 +764,7 @@ use `--json` to get the machine telemetry stream on stderr without `-v`.
 | `--bias <FLOAT>` | legacy: strength multiplier for W-tokens (weighted/combined; hidden) | 2.0 |
 | `--seed-mode <entry\|token>` | legacy: per-entry vs per-token seeding (hidden) | `entry` |
 | `--merge-chunk-size <N>` | `calibrate` only — warns and does nothing on `generate` (no merger runs) | (unused) |
-| `--flush-bytes <BYTES>` | fast mode: bytes a worker buffers before taking the output lock (finer interleave when smaller) | 262144 |
+| `--flush-bytes <BYTES>` | fast mode: bytes a worker buffers before taking the output lock (finer interleave when smaller; does not change the candidate set) | 65536 |
 | `--resume` | continue the previous run from its checkpoint, O(depth) (fast: no `--output` needed; strict: restores its DFS position + byte offset, needs `--output`; `--no-checkpoint` falls back to the re-run + skip-N sidecar) | (off) |
 | `--checkpoint-file <FILE>` | checkpoint to a named path instead of this run's own session-id file | (per-run state file) |
 | `--no-checkpoint` | disable the default checkpoint state file (fast mode) | (off) |

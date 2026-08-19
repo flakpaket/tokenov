@@ -630,12 +630,12 @@ struct GenerateArgs {
 
     /// Bytes each fast-mode worker buffers before taking the shared output lock.
     ///
-    /// This is the live throughput/interleave knob in fast mode: smaller means a
-    /// finer interleave between worker partitions (output closer to rank order),
-    /// larger means fewer lock acquisitions. Throughput is flat across the usable
-    /// range because the sink's 8 MiB BufWriter already amortises the syscalls.
-    /// No effect under --strict (single producer, no interleaving).
-    #[arg(long, default_value_t = 262144, value_name = "BYTES", hide = true)]
+    /// Smaller means a finer interleave between worker partitions (output closer
+    /// to rank order); larger means fewer lock acquisitions. It does NOT change
+    /// which candidates are emitted — each worker's quota fixes the set, so this
+    /// only reorders the file. Throughput is flat because the sink's 8 MiB
+    /// BufWriter already amortises the syscalls. No effect under --strict.
+    #[arg(long, default_value_t = 65536, value_name = "BYTES", hide = true)]
     flush_bytes: usize,
 
     /// Skip inline auto-tune (strict mode, no sidecar); use the default chunk size.
@@ -3664,9 +3664,18 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                         // crash — nothing left to emit.
                         return Ok(());
                     }
-                    // Per-worker output buffer (--flush-bytes). Measured A/B across
-                    // 32 KB..1 MB: throughput flat, so the default favours the finer
-                    // interleave rather than the fewest locks. See issue-066.
+                    // Per-worker output buffer (--flush-bytes). Measured on 8 cores,
+                    // tokenov_v1, 1e8 candidates, 4 counterbalanced rounds (median
+                    // cand/s, vs the old 256 KB default):
+                    //     32 KB  2,976,304  -2.7%
+                    //     64 KB  3,049,874  -0.3%   <- default
+                    //    256 KB  3,058,286    ---
+                    //      1 MB  3,097,048  +1.3%
+                    // Run-to-run spread is 5-9%, which swamps every between-size
+                    // difference: throughput is flat from 64 KB up. The default is
+                    // therefore chosen for interleave granularity (4x finer than
+                    // 256 KB), which is what a consumer that stops early sees. Not
+                    // re-litigating this without new numbers. See issue-066.
                     let flush: usize = flush_bytes;
                     // Emit buffer + counts, shared with the checkpoint callback so it
                     // can flush durably before recording the DFS position.
