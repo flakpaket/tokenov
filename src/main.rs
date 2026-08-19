@@ -3391,7 +3391,14 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // retire after finishing their current domain.
     let active_target = Arc::new(AtomicUsize::new(n_threads));
 
-    let sink = if sidecar_resume {
+    // Any resume that continues an existing --output must APPEND. Before, only
+    // the sidecar path did; a checkpoint-based fast-mode resume fell through to
+    // Sink::open (File::create) and truncated the file it was meant to continue —
+    // destroying every candidate already written. Overlap on resume is safe (a
+    // worker's checkpoint is published after its buffer is flushed, so the saved
+    // position never sits ahead of durable output); truncation is not.
+    let resuming_output = sidecar_resume || resume_from.is_some();
+    let sink = if resuming_output && args.output.is_some() {
         Sink::open_append(args.output.as_ref().unwrap())?
     } else {
         Sink::open(args.output.as_deref())?
@@ -3490,7 +3497,11 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             log_msg(&format!("[gen] resuming from {} ({} threads: {} done, {} in-progress)",
                 rp.display(), cf.slots.len(), n_done, n_prog));
             if n_done == cf.slots.len() {
+                // Every partition finished. Return NOW, before the sink is opened:
+                // continuing would re-open --output and leave the completed run's
+                // candidates truncated away for no gain.
                 log_msg("[gen] previous run already complete — nothing to resume");
+                return Ok(());
             }
             cf.slots
         } else {
@@ -5335,7 +5346,15 @@ where
                 thread_label, r.init_idx, states.len());
         }
     }
+    // Set whenever this pass defers work to a higher level — either a branch
+    // pruned by the level cutoff or an initial state above it. Level pruning is
+    // the ONLY reason a candidate is held back, so a pass that defers nothing has
+    // enumerated everything reachable: every higher level is empty and sweeping to
+    // LEVEL_MAX just burns time (measured: 230s of empty passes on a model whose
+    // space exhausts before --count).
+    let mut deferred_any;
     'main: for target_level in resume_tl..=LEVEL_MAX {
+        deferred_any = false;
         // On resume the first pass starts at the saved init_idx (earlier inits in
         // that pass already completed pre-checkpoint); later passes start at 0.
         let init_start = if target_level == resume_tl { resume_ii } else { 0 };
@@ -5343,6 +5362,7 @@ where
             let init = &states[ii];
             let init_level = lp_to_level(init.log_prob);
             if init_level > target_level {
+                deferred_any = true;
                 break; // states are sorted; no further state can contribute here
             }
 
@@ -5466,6 +5486,7 @@ where
                 let new_level = frame.acc_level + lp_to_level(child_lp);
 
                 if new_level > target_level {
+                    deferred_any = true;
                     // Prune: lp_to_level ≥ 1 per transition, so deeper extensions
                     // also exceed target_level. And since children are descending-lp
                     // (nondecreasing level), every remaining sibling in this frame
@@ -5589,6 +5610,11 @@ where
                     });
                 }
             }
+        }
+
+        if !deferred_any {
+            // Nothing was held back for a higher level — the space is exhausted.
+            break 'main;
         }
 
         if last_log.elapsed().as_secs() >= 30 {
