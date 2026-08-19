@@ -253,13 +253,6 @@ struct Cli {
     // Declared after the flatten so the "Generation" heading leads `-h` (heading
     // order follows first-encounter). These two join the "Resume & checkpointing"
     // block via the shared heading regardless of position.
-    /// List recent generation sessions and exit (newest first).
-    #[arg(long, help_heading = "Resume & checkpointing")]
-    sessions: bool,
-
-    /// Resume a recorded session by ID (see `--sessions`).
-    #[arg(long, value_name = "ID", help_heading = "Resume & checkpointing")]
-    resume_session: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -616,12 +609,34 @@ struct GenerateArgs {
     #[arg(long, default_value_t = false, help_heading = "Resume & checkpointing")]
     resume: bool,
 
+    /// List recent generation sessions and exit (newest first).
+    ///
+    /// Declared here rather than only on the top-level command so that both
+    /// `tokenov --sessions` and `tokenov generate --sessions` work; the latter
+    /// used to error with "unexpected argument".
+    #[arg(long, help_heading = "Resume & checkpointing")]
+    sessions: bool,
+
+    /// Resume a recorded session by ID (see `--sessions`).
+    #[arg(long, value_name = "ID", help_heading = "Resume & checkpointing")]
+    resume_session: Option<String>,
+
     /// Merger chunk size (strict mode only): items batched per channel send.
     ///
     /// Higher = less overhead; lower = tighter ordering; 1 = per-item. If
     /// omitted, uses a `.tune.toml` sidecar if present, else auto-tunes.
     #[arg(long, value_name = "N", help_heading = "Merger tuning")]
     merge_chunk_size: Option<usize>,
+
+    /// Bytes each fast-mode worker buffers before taking the shared output lock.
+    ///
+    /// This is the live throughput/interleave knob in fast mode: smaller means a
+    /// finer interleave between worker partitions (output closer to rank order),
+    /// larger means fewer lock acquisitions. Throughput is flat across the usable
+    /// range because the sink's 8 MiB BufWriter already amortises the syscalls.
+    /// No effect under --strict (single producer, no interleaving).
+    #[arg(long, default_value_t = 262144, value_name = "BYTES", hide = true)]
+    flush_bytes: usize,
 
     /// Skip inline auto-tune (strict mode, no sidecar); use the default chunk size.
     ///
@@ -2743,6 +2758,10 @@ fn partition_seeds_by_first_token(seeds: Vec<HeapEntry>, n: usize) -> Vec<Vec<He
 // recovery instead of partial-file recovery.)
 
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
+    // `tokenov generate --sessions` / `--resume-session` behave exactly like the
+    // top-level spellings instead of erroring (issue-064 item 6).
+    if args.sessions { return list_sessions(); }
+    if let Some(id) = args.resume_session.clone() { return resume_session(&id); }
     // Validate
     if args.bias <= 0.0 {
         bail!("--bias must be positive (got {})", args.bias);
@@ -2761,6 +2780,16 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         warn_msg("warning: --skipgram-expand is DEPRECATED and now a no-op (ignored). \
                  Expand your seed list separately and pass the result to --wordlist.");
         args.skipgram_expand = 0;
+    }
+    // issue-060: the k-way merger these knobs configure is unreachable from
+    // `generate` — fast mode writes directly to the sink, and --strict is clamped
+    // to one thread (also no merger). They survive only for the hidden `calibrate`
+    // subcommand. Say so instead of silently ignoring them.
+    if args.merge_chunk_size.is_some() || args.no_auto_tune || args.runtime_tune {
+        warn_msg("warning: --merge-chunk-size / --no-auto-tune / --runtime-tune \
+                  have no effect on `generate` (no merger runs: fast mode writes directly, \
+                  --strict is single-threaded). They apply to `tokenov calibrate` only. \
+                  The live fast-mode knob is --flush-bytes.");
     }
     if args.min_tokens < 1 {
         bail!("--min-tokens must be >= 1");
@@ -3060,27 +3089,36 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // --no-checkpoint). Strict is single-threaded, so its checkpoint is a single
     // DFS-position slot restored in O(depth) on resume — same machinery as a fast
     // worker, no re-enumeration from candidate 0.
+    let run_id = new_run_id();
     let checkpoint_to: Option<PathBuf> = if args.no_checkpoint {
         None
     } else {
         Some(args.checkpoint_file.clone()
             .or_else(|| explicit_resume.clone())
-            .unwrap_or_else(default_checkpoint_path))
+            .unwrap_or_else(|| default_checkpoint_path(&run_id)))
     };
-    // Where to READ a resume from: explicit --resume-state, else --resume resolves
-    // to the checkpoint we'd write to (named or default).
-    let resume_from: Option<PathBuf> = explicit_resume
-        .or_else(|| if args.resume { checkpoint_to.clone() } else { None });
-    // The SIDECAR resume path (re-run + skip-N) applies only when no checkpoint
-    // resume does — i.e. --no-checkpoint --resume. This is what the skip-N block
-    // below keys on.
-    let sidecar_resume = args.resume && resume_from.is_none();
     // Checkpoint fingerprint: binds model+args+threads (args_fp) AND the tokenov
     // version (enumeration order is version-sensitive, so resuming a saved DFS
     // stack under a different binary would corrupt it). Used for the checkpoint
     // file in both fast and strict modes; the progress sidecar keeps args_fp.
     let ckpt_fp = format!("{} tokenov={}", args_fp, env!("CARGO_PKG_VERSION"));
-    // Rolling default checkpoint (not a user-named file) → remove on clean completion.
+    // Where to READ a resume from: explicit --resume-state wins; a user-named
+    // --checkpoint-file resumes itself; otherwise `--resume` searches the per-run
+    // checkpoints for the newest one that matches this run's fingerprint and still
+    // has work left. (Before per-run state this was just "the one global file".)
+    let resume_from: Option<PathBuf> = explicit_resume.clone()
+        .or_else(|| if !args.resume {
+            None
+        } else if args.checkpoint_file.is_some() {
+            checkpoint_to.clone()
+        } else {
+            find_resumable_checkpoint(&ckpt_fp)
+        });
+    // The SIDECAR resume path (re-run + skip-N) applies only when no checkpoint
+    // resume does — i.e. --no-checkpoint --resume, or --resume with nothing found.
+    let sidecar_resume = args.resume && resume_from.is_none();
+    // This run owns its default checkpoint, so clearing it on clean completion can
+    // only ever discard our own finished state.
     let ckpt_is_default = checkpoint_to.is_some() && !user_named_ckpt;
 
     // Strict checkpoint resume (single-thread O(depth) restore). When resuming a
@@ -3426,9 +3464,12 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     let initial_chunk_size = resolve_chunk_size(&model_path, &args, cache_mode, Some(calib_setup))?;
     let chunk_size_atomic = Arc::new(AtomicUsize::new(initial_chunk_size));
     let channel_chunks = (MERGE_CHANNEL_BUFFER_ITEMS / initial_chunk_size).max(2);
+    // Only the strict multi-thread merger consumes these, and `generate` cannot
+    // reach it (strict is clamped to one thread), so don't announce a merger
+    // config that will not be used. `calibrate` logs its own.
     log_msg(&format!(
-        "[gen] merge: chunk_size={} channel_capacity={} chunks/channel ({} items/channel)",
-        initial_chunk_size, channel_chunks, channel_chunks * initial_chunk_size));
+        "[gen] merge params (unused by generate; calibrate-only): chunk_size={} channel_capacity={}",
+        initial_chunk_size, channel_chunks));
 
     // N channels — one per worker thread. Workers write all their domains to
     // their own channel; the channel stays open until the worker exits.
@@ -3449,6 +3490,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     }
     // enum_model, decode_table, start_id, end_id are already in scope from the
     // earlier hoist (just before resolve_chunk_size). Continuing with worker setup.
+    let flush_bytes   = args.flush_bytes.max(4096);
     let max_tokens    = args.max_tokens;
     let min_tokens    = args.min_tokens;
     let min_len       = args.min_len;
@@ -3533,7 +3575,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     return Some(rec.id);
                 }
             }
-            session_start(&model_path, args.count, n_threads, cp)
+            session_start(&model_path, args.count, n_threads, cp, &run_id)
         });
 
         let telemetry_enabled = args.stats_interval_ms > 0;
@@ -3622,11 +3664,14 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                         // crash — nothing left to emit.
                         return Ok(());
                     }
-                    const FLUSH: usize = 256 * 1024;
+                    // Per-worker output buffer (--flush-bytes). Measured A/B across
+                    // 32 KB..1 MB: throughput flat, so the default favours the finer
+                    // interleave rather than the fewest locks. See issue-066.
+                    let flush: usize = flush_bytes;
                     // Emit buffer + counts, shared with the checkpoint callback so it
                     // can flush durably before recording the DFS position.
                     let em_cell = std::cell::RefCell::new(Emitter {
-                        buf: Vec::with_capacity(FLUSH + 1024), n: 0, b: 0, rep_n: 0, rep_b: 0,
+                        buf: Vec::with_capacity(flush + 1024), n: 0, b: 0, rep_n: 0, rep_b: 0,
                     });
                     let res = enumerate_to_sink(
                         &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
@@ -3637,7 +3682,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                             e.buf.push(b'\n');
                             e.n += 1;
                             e.b += bytes.len() as u64 + 1;
-                            if e.buf.len() >= FLUSH {
+                            if e.buf.len() >= flush {
                                 emitter_flush(&mut e, &sink, &stats, false)?; // hot path: no OS flush
                             }
                             Ok(())
@@ -4872,17 +4917,58 @@ fn sessions_dir() -> Option<PathBuf> {
     Some(d)
 }
 
-/// Rolling default checkpoint path used when fast-mode generation checkpoints
-/// without an explicit `--checkpoint-file`. One "last run" slot in the state dir;
-/// name a `--checkpoint-file` to keep several tasks in parallel. Falls back to the
-/// current directory if neither XDG_STATE_HOME nor HOME is set.
-fn default_checkpoint_path() -> PathBuf {
+/// Mint the id used for this run's session record AND its checkpoint file.
+/// Called once, before checkpoint paths are resolved, so both halves of a run's
+/// state share one identity.
+fn new_run_id() -> String {
+    format!("s{}-{}", now_secs(), std::process::id())
+}
+
+/// Default checkpoint path for a run: **per run**, named by its session id.
+///
+/// This used to be a single global `generate.state` shared by every `generate`
+/// invocation, which meant an unrelated short run could overwrite a long run's
+/// DFS position while it was still going, and delete it outright on clean exit —
+/// measured data loss: a 2-day, 46.5M-candidate run lost its resume state to two
+/// unrelated smoke runs (issue-064). A run now only ever writes, reads, and
+/// unlinks state carrying its own id, so cross-run damage is impossible by
+/// construction. Falls back to the current directory if neither XDG_STATE_HOME
+/// nor HOME is set.
+fn default_checkpoint_path(run_id: &str) -> PathBuf {
+    if let Some(d) = sessions_dir() {
+        return d.join(format!("{run_id}.ckpt"));
+    }
     let base = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
         .unwrap_or_else(|| PathBuf::from("."));
     let d = base.join("tokenov");
     let _ = std::fs::create_dir_all(&d);
-    d.join("generate.state")
+    d.join(format!("{run_id}.ckpt"))
+}
+
+/// Newest resumable checkpoint whose fingerprint matches this run, scanning the
+/// per-run checkpoints in the sessions dir. Replaces "resume reads the one global
+/// file": with per-run state, `--resume` has to *find* the run it belongs to.
+/// Skips checkpoints that are fully `Done` (nothing left) and any whose
+/// fingerprint differs (different model/args/version).
+fn find_resumable_checkpoint(ckpt_fp: &str) -> Option<PathBuf> {
+    let d = sessions_dir()?;
+    let mut cands: Vec<(u64, PathBuf)> = Vec::new();
+    for e in std::fs::read_dir(&d).ok()? {
+        let p = match e { Ok(e) => e.path(), Err(_) => continue };
+        if p.extension().and_then(|x| x.to_str()) != Some("ckpt") { continue; }
+        let cf = match read_checkpoint(&p) { Ok(c) => c, Err(_) => continue };
+        if cf.fingerprint != ckpt_fp { continue; }
+        if !cf.slots.is_empty() && cf.slots.iter().all(|s| matches!(s, CkptSlot::Done)) { continue; }
+        if !cf.slots.iter().any(|s| matches!(s, CkptSlot::InProgress(_))) { continue; }
+        let mtime = std::fs::metadata(&p).ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(0);
+        cands.push((mtime, p));
+    }
+    cands.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    cands.into_iter().next().map(|(_, p)| p)
 }
 
 #[derive(Clone, Debug)]
@@ -4961,8 +5047,9 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// Create a session record at gen start and prune to the newest MAX_SESSIONS.
-fn session_start(model: &Path, count: Option<u64>, threads: usize, checkpoint_file: &Path) -> Option<String> {
-    let id = format!("s{}-{}", now_secs(), std::process::id());
+fn session_start(model: &Path, count: Option<u64>, threads: usize, checkpoint_file: &Path,
+                 run_id: &str) -> Option<String> {
+    let id = run_id.to_string();
     let argv: Vec<String> = std::env::args().skip(1)
         // drop any prior --resume-state/--resume-session so re-resume re-derives it cleanly
         .scan(false, |skip_next, a| {
@@ -4979,10 +5066,25 @@ fn session_start(model: &Path, count: Option<u64>, threads: usize, checkpoint_fi
         status: "running".into(), emitted: 0, argv,
     };
     write_session(&rec).ok()?;
-    // Ring-buffer: keep newest MAX_SESSIONS, delete older.
+    // Ring-buffer: keep newest MAX_SESSIONS. Over the cap, evict COMPLETED runs
+    // first — an interrupted run still holds a resumable position, and dropping it
+    // to make room for finished history is the same class of loss this issue fixed.
     let all = load_sessions();
-    for old in all.into_iter().skip(MAX_SESSIONS) {
-        if let Some(p) = session_path(&old.id) { let _ = std::fs::remove_file(p); }
+    if all.len() > MAX_SESSIONS {
+        let overflow = all.len() - MAX_SESSIONS;
+        let mut victims: Vec<&SessionRecord> = all.iter()
+            .filter(|r| r.status == "done").rev().take(overflow).collect();
+        if victims.len() < overflow {
+            // Not enough completed records to evict: fall back to oldest-first.
+            for r in all.iter().rev() {
+                if victims.len() >= overflow { break; }
+                if !victims.iter().any(|v| v.id == r.id) { victims.push(r); }
+            }
+        }
+        for v in victims {
+            if let Some(p) = session_path(&v.id) { let _ = std::fs::remove_file(p); }
+            if let Some(d) = sessions_dir() { let _ = std::fs::remove_file(d.join(format!("{}.ckpt", v.id))); }
+        }
     }
     Some(id)
 }
@@ -6939,10 +7041,10 @@ fn main() -> Result<()> {
         registry::list();
         return Ok(());
     }
-    if cli.sessions {
+    if cli.generate_args.sessions {
         return list_sessions();
     }
-    if let Some(id) = &cli.resume_session {
+    if let Some(id) = &cli.generate_args.resume_session {
         return resume_session(id);
     }
     match cli.command {
