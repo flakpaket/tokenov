@@ -264,7 +264,8 @@ enum Command {
     /// Emit candidates (default if no subcommand is given).
     Generate(GenerateArgs),
     /// Score candidate password(s): report each candidate's Rarity (surprisal,
-    /// in bits) under the model. Reads candidates from args, --file, or stdin.
+    /// in bits) and the enumeration level `generate` would emit it in. Reads
+    /// candidates from args, --file, or stdin.
     Score(ScoreArgs),
     /// Quickstart: fetch a tokenizer + RockYou, then train + register a model.
     Bootstrap(bootstrap::BootstrapArgs),
@@ -584,6 +585,18 @@ struct GenerateArgs {
     /// don't count toward --count, so generation enumerates deeper to reach it.
     #[arg(long, default_value_t = 1, value_name = "N", help_heading = "Generation")]
     min_tokens: usize,
+
+    /// Start enumeration at probability level N, skipping the more-probable
+    /// levels below it. 0 (default) is a no-op.
+    ///
+    /// Enumeration walks levels 0, 1, 2, … in order, so --count is a ceiling on
+    /// depth and this is the matching floor. The stream is an exact suffix of the
+    /// full run: same candidates, same order, minus the skipped levels. Long
+    /// candidates concentrate at higher levels, but the overlap is wide — this is
+    /// a stream-volume knob, not a length filter; use it with --min-len. Run with
+    /// -v to see the level a run stopped at.
+    #[arg(long, default_value_t = 0, value_name = "N", help_heading = "Generation")]
+    min_level: u32,
 
     /// Write candidates (plain UTF-8, one per line) here instead of stdout.
     ///
@@ -2812,6 +2825,23 @@ fn resolve_unigram_tail(unigram_tail: Option<f32>, variant: &str) -> Result<(Str
     Ok((variant_name, unigram_logw))
 }
 
+/// `--min-level` is a floor on the enumerator's level sweep. Reject, rather than
+/// ignore, the two settings where it would silently do nothing: past `LEVEL_MAX`
+/// the sweep is empty and the run emits not one candidate, and the graft
+/// generator has no level sweep to floor at all.
+fn validate_min_level(min_level: u32, run_graft: bool, float: bool) -> Result<()> {
+    if min_level > LEVEL_MAX {
+        bail!("--min-level ({}) exceeds the maximum level {} — nothing would be emitted",
+            min_level, LEVEL_MAX);
+    }
+    if min_level > 0 && run_graft {
+        bail!("--min-level has no effect with {} (that generator ranks seeds by \
+               surprisal instead of sweeping levels)",
+            if float { "--float" } else { "--prepend-only" });
+    }
+    Ok(())
+}
+
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // `tokenov generate --sessions` / `--resume-session` behave exactly like the
     // top-level spellings instead of erroring (issue-064 item 6).
@@ -2863,6 +2893,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     }
     let run_graft = args.wordlist.is_some() && args.mode.is_none()
         && (args.prepend_only || args.float);
+    validate_min_level(args.min_level, run_graft, args.float)?;
     // Concrete mode for the legacy machinery + the graft generator's unbiased
     // model prep. None → Seeded (unbiased; --append-only is exactly seeded).
     let legacy_mode: Mode = args.mode.unwrap_or(Mode::Seeded);
@@ -3211,6 +3242,18 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             _ => None, // NotStarted / empty → start fresh
         }
     } else { None };
+    // --resume wins over --min-level: a checkpoint already encodes a start
+    // position, and its target_level can only sit at or past the floor the run
+    // began with (--min-level is part of the fingerprint, which must match). A
+    // checkpoint below the floor therefore means a hand-edited or foreign state
+    // file — refuse rather than silently re-emit the skipped levels.
+    if let Some(c) = &strict_ckpt_resume {
+        if c.target_level < args.min_level {
+            bail!("--resume: checkpoint is at level {} but --min-level is {} — \
+                   resuming it would re-emit levels below the floor",
+                c.target_level, args.min_level);
+        }
+    }
 
     // Compute (skip_first, initial_bytes) from the progress sidecar if resuming.
     let (skip_first, initial_bytes): (u64, u64) = if strict_ckpt_resume.is_some() {
@@ -3315,6 +3358,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             &enum_model, &*variant, child_cache, cache_mode, &model.decode, kind,
             model.start_id, model.end_id, initial_states,
             args.max_tokens, args.min_tokens, args.min_len, args.max_len,
+            args.min_level,
             target_count,
             args.enterprise,
             &case_masks,
@@ -3557,6 +3601,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     let min_tokens    = args.min_tokens;
     let min_len       = args.min_len;
     let max_len       = args.max_len;
+    let min_level     = args.min_level;
     let enterprise    = args.enterprise;
 
     // (--fast/--strict and strict+checkpoint validation, plus checkpoint_to/resume_from
@@ -3618,6 +3663,17 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         }).collect();
         let worker_done: Vec<bool> =
             resume_slots.iter().map(|s| matches!(s, CkptSlot::Done)).collect();
+        // Same floor check as the strict path, over EVERY worker slot — checked
+        // here, before any worker spawns, so a bad state file can't leave a run
+        // half-started.
+        for (i, ck) in worker_resume.iter().enumerate() {
+            let Some(c) = ck else { continue };
+            if c.target_level < args.min_level {
+                bail!("--resume: worker {} checkpoint is at level {} but --min-level is {} — \
+                       resuming it would re-emit levels below the floor",
+                    i, c.target_level, args.min_level);
+            }
+        }
         let slots: Arc<Vec<std::sync::Mutex<CkptSlot>>> =
             Arc::new(resume_slots.into_iter().map(std::sync::Mutex::new).collect());
         let ckpt_stop = Arc::new(AtomicBool::new(false));
@@ -3746,7 +3802,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     });
                     let res = enumerate_to_sink(
                         &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
-                        states, max_tokens, min_tokens, min_len, max_len, thread_target, enterprise, &cm,
+                        states, max_tokens, min_tokens, min_len, max_len, min_level, thread_target, enterprise, &cm,
                         |_lvl, _sk, bytes| {
                             let mut e = em_cell.borrow_mut();
                             e.buf.extend_from_slice(bytes);
@@ -3973,6 +4029,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                 let res = enumerate_to_sink(
                     &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
                     states, max_tokens, min_tokens, min_len, max_len,
+                    min_level,
                     thread_target,
                     enterprise,
                     &cm,
@@ -4750,6 +4807,13 @@ fn build_args_fingerprint(
     write!(s, "skipgram_expand={} skipgram_direction={:?} ",
         args.skipgram_expand, args.skipgram_direction).unwrap();
     write!(s, "wordlist={:?}", args.wordlist).unwrap();
+    // Appended only when set, so a default run's fingerprint is unchanged from
+    // 1.0.0 and an in-flight `--no-checkpoint` sidecar resume still matches.
+    // (The checkpoint file's own fingerprint already carries the crate version,
+    // so it never crosses a release boundary anyway.)
+    if args.min_level > 0 {
+        write!(s, " min_level={}", args.min_level).unwrap();
+    }
     Ok(s)
 }
 
@@ -5413,6 +5477,10 @@ fn enumerate_to_sink<F, H>(
     min_tokens: usize,
     min_len: usize,
     max_len: usize,
+    // Floor on the level sweep (`--min-level`): levels below it are never walked,
+    // so the stream is an exact suffix of the same run at 0. Ignored when `resume`
+    // is Some — the checkpoint's own target_level already sits at or past the floor.
+    min_level: u32,
     target_count: u64,
     enterprise: bool,
     case_masks: &[CaseMask],
@@ -5435,7 +5503,7 @@ where
     let mut last_ckpt = Instant::now();
     let mut iter_ctr: u64 = 0;
     let (resume_tl, resume_ii) = resume.as_ref()
-        .map(|r| (r.target_level, r.init_idx)).unwrap_or((0, 0));
+        .map(|r| (r.target_level, r.init_idx)).unwrap_or((min_level, 0));
     let mut resume_taken = resume.is_none();
     let mut emitted: u64 = resume.as_ref().map(|r| r.emitted).unwrap_or(0);
     let mut decode_buf: Vec<u8> = Vec::with_capacity(64); // case-mask path only
@@ -5533,8 +5601,12 @@ where
     // LEVEL_MAX just burns time (measured: 230s of empty passes on a model whose
     // space exhausts before --count).
     let mut deferred_any;
+    // Shell this worker was in when it stopped — reported on the DONE line so an
+    // operator who ended a run with --count can see where to point --min-level.
+    let mut last_level = resume_tl;
     'main: for target_level in resume_tl..=LEVEL_MAX {
         deferred_any = false;
+        last_level = target_level;
         // On resume the first pass starts at the saved init_idx (earlier inits in
         // that pass already completed pre-checkpoint); later passes start at 0.
         let init_start = if target_level == resume_tl { resume_ii } else { 0 };
@@ -5810,8 +5882,9 @@ where
         format!(" bounded[hits={} misses={} hit_rate={:.1}% resident={}]",
             b.hits, b.misses, hr, b.young.len() + b.old.len())
     }).unwrap_or_default();
-    log_msg(&format!("{}[gen] DONE emitted={} local_misses={}{} in {:.0}s",
-        thread_label, emitted, local_misses, bounded_stats, t0.elapsed().as_secs_f64()));
+    log_msg(&format!("{}[gen] DONE emitted={} local_misses={}{} in {:.0}s level={}",
+        thread_label, emitted, local_misses, bounded_stats, t0.elapsed().as_secs_f64(),
+        last_level));
     Ok(())
 }
 
@@ -5999,10 +6072,12 @@ enum ScoreFormat {
     Table,
     /// Tab-separated: candidate, n_tok, surprisal_bits, surprisal_per_tok_bits,
     /// in_vocab, segmentation, per_pos_surprisal_bits, per_pos_floored (the last
-    /// two comma-joined, one entry per transition incl. the trailing END step).
+    /// two comma-joined, one entry per transition incl. the trailing END step),
+    /// level (`-` if unreachable).
     Tsv,
-    /// One JSON object per line (surprisal_bits/_per_tok in bits; +inf → null).
-    /// Includes a `positions` array of per-transition {label, surprisal_bits, floored}.
+    /// One JSON object per line (surprisal_bits/_per_tok in bits; +inf → null;
+    /// `level` is an integer, or null if unreachable). Includes a `positions`
+    /// array of per-transition {label, surprisal_bits, floored}.
     Jsonl,
 }
 
@@ -6061,6 +6136,14 @@ struct Scored {
     /// True iff fully on the trigram/bigram support (no floor used). In finite
     /// mode a floored candidate is still finite but reports `in_vocab = false`.
     in_vocab: bool,
+    /// Enumeration level of this token path — the pass `generate` emits it in.
+    /// Computed exactly as the enumerator does (`lp_to_level` per transition,
+    /// END step included, summed), so it is directly comparable with
+    /// `--min-level` and with the `level=` on a run's DONE line. `None` when the
+    /// candidate is unreachable (`--reachable` ⇒ `+inf` Rarity). Hypothetical
+    /// whenever `in_vocab` is false: those transitions come from the scorer's
+    /// add-k floor, and the default generator has no such tier to emit them from.
+    level: Option<u32>,
     segmentation: Vec<String>,
     /// One entry per transition (each token, then `END`); surprisals sum to
     /// `surprisal_bits`. Drives the per-position display and per-position floor
@@ -6106,6 +6189,12 @@ fn score_candidate(em: &EnumModel, model: &Model, tokenizer: &Tokenizer, cand: &
     let mut lp = 0f32;
     let mut ok = n_tok > 0;
     let mut floored = false;
+    // Enumeration level, accumulated the way the DFS does it (`main.rs` sweep:
+    // `new_level = frame.acc_level + lp_to_level(child_lp)`) — per-transition
+    // ceiling in nats, summed, END step included. NOT ceil(total surprisal): the
+    // rounding is per step, so the level runs above the joint by up to one per
+    // transition.
+    let mut level: u32 = 0;
     let mut steps: Vec<StepScore> = Vec::with_capacity(n_tok + 1);
     if ok {
         for (i, &t) in ids.iter().enumerate() {
@@ -6121,6 +6210,7 @@ fn score_candidate(em: &EnumModel, model: &Model, tokenizer: &Tokenizer, cand: &
                 }
             };
             lp += step;
+            level += lp_to_level(step);
             steps.push(StepScore { label: segmentation[i].clone(), surprisal_bits: nats_to_bits(step), floored: this_floored });
             a = b;
             b = t;
@@ -6132,8 +6222,8 @@ fn score_candidate(em: &EnumModel, model: &Model, tokenizer: &Tokenizer, cand: &
     // with the generator's emission order, and matches FLA's end-symbol handling).
     if ok {
         match transition_logprob(em, a, b, model.end_id) {
-            Some(step) => { lp += step; steps.push(StepScore { label: "END".into(), surprisal_bits: nats_to_bits(step), floored: false }); }
-            None if finite => { floored = true; let step = floor_step(a, b, model.end_id); lp += step; steps.push(StepScore { label: "END".into(), surprisal_bits: nats_to_bits(step), floored: true }); }
+            Some(step) => { lp += step; level += lp_to_level(step); steps.push(StepScore { label: "END".into(), surprisal_bits: nats_to_bits(step), floored: false }); }
+            None if finite => { floored = true; let step = floor_step(a, b, model.end_id); lp += step; level += lp_to_level(step); steps.push(StepScore { label: "END".into(), surprisal_bits: nats_to_bits(step), floored: true }); }
             None => { ok = false; steps.push(StepScore { label: "END".into(), surprisal_bits: f64::INFINITY, floored: false }); }
         }
     }
@@ -6158,6 +6248,9 @@ fn score_candidate(em: &EnumModel, model: &Model, tokenizer: &Tokenizer, cand: &
         surprisal_bits,
         surprisal_per_tok_bits,
         in_vocab,
+        // Only meaningful when every transition was scored; an unreachable
+        // candidate broke out of the walk with a partial sum.
+        level: if surprisal_bits.is_finite() { Some(level) } else { None },
         segmentation,
         steps,
     }
@@ -6176,6 +6269,15 @@ fn fmt_positional_segmentation(steps: &[StepScore]) -> String {
         parts.push(format!("{}({}{})", st.label, fmt_bits(st.surprisal_bits, 1), star));
     }
     parts.join("|")
+}
+
+/// Enumeration level for the table: `-` when the candidate is unreachable and
+/// there is no pass that would ever emit it.
+fn fmt_level(v: Option<u32>) -> String {
+    match v {
+        Some(l) => l.to_string(),
+        None => "-".to_string(),
+    }
 }
 
 fn fmt_bits(v: f64, prec: usize) -> String {
@@ -6257,17 +6359,18 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                 // Compact columns + the per-position Segment Score breakdown.
                 writeln!(
                     w,
-                    "{:<20} {:>6}  {:>12}  {:<24}  {}",
-                    "Candidate", "Tokens", "Rarity(bits)", "Segmentation", "Segment Score"
+                    "{:<20} {:>6}  {:>12}  {:>5}  {:<24}  {}",
+                    "Candidate", "Tokens", "Rarity(bits)", "Level", "Segmentation", "Segment Score"
                 )?;
                 for c in &candidates {
                     let s = score_candidate(&em, &model, &tokenizer, c, finite, total_unigram);
                     writeln!(
                         w,
-                        "{:<20} {:>6}  {:>12}  {:<24}  {}",
+                        "{:<20} {:>6}  {:>12}  {:>5}  {:<24}  {}",
                         truncate_display(&s.candidate, 20),
                         s.n_tok,
                         fmt_bits(s.surprisal_bits, 1),
+                        fmt_level(s.level),
                         s.segmentation.join("|"),
                         fmt_positional_segmentation(&s.steps)
                     )?;
@@ -6277,17 +6380,18 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                 // per-position Segment Score column.
                 writeln!(
                     w,
-                    "{:<20} {:>6}  {:>12}  {}",
-                    "Candidate", "Tokens", "Rarity(bits)", "Segmentation"
+                    "{:<20} {:>6}  {:>12}  {:>5}  {}",
+                    "Candidate", "Tokens", "Rarity(bits)", "Level", "Segmentation"
                 )?;
                 for c in &candidates {
                     let s = score_candidate(&em, &model, &tokenizer, c, finite, total_unigram);
                     writeln!(
                         w,
-                        "{:<20} {:>6}  {:>12}  {}",
+                        "{:<20} {:>6}  {:>12}  {:>5}  {}",
                         truncate_display(&s.candidate, 20),
                         s.n_tok,
                         fmt_bits(s.surprisal_bits, 1),
+                        fmt_level(s.level),
                         s.segmentation.join("|")
                     )?;
                 }
@@ -6298,9 +6402,11 @@ fn run_score(args: ScoreArgs) -> Result<()> {
             // trailing END step) — so they have n_tok+1 entries; the last is END.
             // per_pos_surprisal_bits sums to surprisal_bits; per_pos_floored is
             // 0/1 flags marking off-support (floored) steps.
+            // `level` is appended last so column indices 0..7 stay where any
+            // existing consumer expects them.
             writeln!(
                 w,
-                "candidate\tn_tok\tsurprisal_bits\tsurprisal_per_tok_bits\tin_vocab\tsegmentation\tper_pos_surprisal_bits\tper_pos_floored"
+                "candidate\tn_tok\tsurprisal_bits\tsurprisal_per_tok_bits\tin_vocab\tsegmentation\tper_pos_surprisal_bits\tper_pos_floored\tlevel"
             )?;
             for c in &candidates {
                 let s = score_candidate(&em, &model, &tokenizer, c, finite, total_unigram);
@@ -6308,7 +6414,7 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                 let per_pos_floored = s.steps.iter().map(|st| if st.floored { "1" } else { "0" }).collect::<Vec<_>>().join(",");
                 writeln!(
                     w,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     s.candidate,
                     s.n_tok,
                     fmt_bits(s.surprisal_bits, 4),
@@ -6316,7 +6422,8 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                     s.in_vocab,
                     s.segmentation.join("|"),
                     per_pos_bits,
-                    per_pos_floored
+                    per_pos_floored,
+                    fmt_level(s.level)
                 )?;
             }
         }
@@ -6344,12 +6451,13 @@ fn run_score(args: ScoreArgs) -> Result<()> {
                     .join(",");
                 writeln!(
                     w,
-                    "{{\"candidate\":{},\"n_tok\":{},\"surprisal_bits\":{},\"surprisal_per_tok_bits\":{},\"in_vocab\":{},\"segmentation\":[{}],\"positions\":[{}]}}",
+                    "{{\"candidate\":{},\"n_tok\":{},\"surprisal_bits\":{},\"surprisal_per_tok_bits\":{},\"in_vocab\":{},\"level\":{},\"segmentation\":[{}],\"positions\":[{}]}}",
                     json_str(&s.candidate),
                     s.n_tok,
                     json_num(s.surprisal_bits),
                     json_num(s.surprisal_per_tok_bits),
                     s.in_vocab,
+                    s.level.map(|l| l.to_string()).unwrap_or_else(|| "null".into()),
                     seg,
                     positions
                 )?;
@@ -6872,6 +6980,7 @@ fn do_calibration(
                     // cache here is always populated → CacheMode::Full.
                     &em, &*var, cc, CacheMode::Full, &dt, kind, start_id, end_id,
                     states, max_tokens, 1 /* min_tokens: no filter during calibration */, min_len, max_len,
+                    0, // min_level: calibration always sweeps from level 0
                     thread_target,
                     false, // no enterprise filter during calibration
                     &[],   // no case masks during calibration
@@ -7597,3 +7706,26 @@ mod count_parse_tests {
     }
 }
 
+#[cfg(test)]
+mod min_level_tests {
+    use super::{validate_min_level, LEVEL_MAX};
+
+    #[test]
+    fn default_and_in_range_accepted() {
+        assert!(validate_min_level(0, false, false).is_ok());
+        assert!(validate_min_level(30, false, false).is_ok());
+        assert!(validate_min_level(LEVEL_MAX, false, false).is_ok());
+    }
+
+    #[test]
+    fn rejects_past_level_max() {
+        assert!(validate_min_level(LEVEL_MAX + 1, false, false).is_err());
+    }
+
+    #[test]
+    fn rejects_graft_combination_but_not_the_default() {
+        assert!(validate_min_level(30, true, true).is_err());   // --float
+        assert!(validate_min_level(30, true, false).is_err());  // --prepend-only
+        assert!(validate_min_level(0,  true, true).is_ok());    // unset ⇒ no conflict
+    }
+}
