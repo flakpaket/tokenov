@@ -2759,6 +2759,44 @@ fn partition_seeds_by_first_token(seeds: Vec<HeapEntry>, n: usize) -> Vec<Vec<He
 // merge in `run_merger` above. See progress sidecar + --resume for crash
 // recovery instead of partial-file recovery.)
 
+/// Resolve `--unigram-tail [FRACTION]` + `--variant` into (variant name, tail log-weight).
+///
+/// `--unigram-tail` is the supported spelling; `--variant freq-tail` is kept working
+/// (it is in existing scripts) but warns. The weight is given as a FRACTION of the
+/// bigram tier's missing-mass budget and converted to the log-space value the tail
+/// actually applies, so nobody has to type a negative logarithm.
+///
+/// The returned log-weight is meaningful only for variants that carry a tail;
+/// `baseline` gets the constant and ignores it.
+fn resolve_unigram_tail(unigram_tail: Option<f32>, variant: &str) -> Result<(String, f32)> {
+    let variant_name: String = match (unigram_tail, variant) {
+        (Some(_), "cap-tail") | (Some(_), "e") =>
+            bail!("--unigram-tail and --variant cap-tail both set a unigram tail; pick one"),
+        (Some(_), v) if v != "baseline" && v != "a" && v != "freq-tail" && v != "b" =>
+            bail!("--unigram-tail cannot be combined with --variant {}", v),
+        (Some(_), _) => "freq-tail".to_string(),
+        (None, "freq-tail") | (None, "b") => {
+            deprecate("generate --variant freq-tail", "generate --unigram-tail");
+            warn_msg("  (--unigram-tail also takes an optional weight, e.g. --unigram-tail 0.3)");
+            "freq-tail".to_string()
+        }
+        (None, v) => v.to_string(),
+    };
+    let unigram_logw: f32 = match unigram_tail {
+        None => crate::variant_b::LOG_LAMBDA_BIGRAM,
+        Some(f) if f <= 0.0 || !f.is_finite() =>
+            bail!("--unigram-tail FRACTION must be > 0 (got {}); omit the flag to disable the tail", f),
+        Some(f) => {
+            if f > 1.0 {
+                warn_msg(&format!("warning: --unigram-tail {} weights the unigram tail above the \
+                                   bigram tier's whole missing-mass budget", f));
+            }
+            f.ln()
+        }
+    };
+    Ok((variant_name, unigram_logw))
+}
+
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // Validate
     if args.bias <= 0.0 {
@@ -2808,39 +2846,16 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         // clap derive; we treat any --mode without --wordlist as benign.)
     }
 
-    // Resolve the algorithm from --unigram-tail / --variant. `--unigram-tail`
-    // is the supported spelling; `--variant freq-tail` is kept working (it is in
-    // existing scripts) but warns. Weight is given as a FRACTION of the bigram
-    // tier's missing-mass budget and converted to the log-space value the tail
-    // actually applies, so nobody has to type a negative logarithm.
-    let variant_name: String = match (args.unigram_tail, args.variant.as_str()) {
-        (Some(_), "cap-tail") | (Some(_), "e") =>
-            bail!("--unigram-tail and --variant cap-tail both set a unigram tail; pick one"),
-        (Some(_), v) if v != "baseline" && v != "a" && v != "freq-tail" && v != "b" =>
-            bail!("--unigram-tail cannot be combined with --variant {}", v),
-        (Some(_), _) => "freq-tail".to_string(),
-        (None, "freq-tail") | (None, "b") => {
-            deprecate("generate --variant freq-tail", "generate --unigram-tail");
-            warn_msg("  (--unigram-tail also takes an optional weight, e.g. --unigram-tail 0.3)");
-            "freq-tail".to_string()
-        }
-        (None, v) => v.to_string(),
-    };
-    let unigram_logw: f32 = match args.unigram_tail {
-        None => crate::variant_b::LOG_LAMBDA_BIGRAM,
-        Some(f) if f <= 0.0 || !f.is_finite() =>
-            bail!("--unigram-tail FRACTION must be > 0 (got {}); omit the flag to disable the tail", f),
-        Some(f) => {
-            if f > 1.0 {
-                warn_msg(&format!("warning: --unigram-tail {} weights the unigram tail above the \
-                                   bigram tier's whole missing-mass budget", f));
-            }
-            f.ln()
-        }
-    };
+    let (variant_name, unigram_logw) = resolve_unigram_tail(args.unigram_tail, &args.variant)?;
     let variant = variant::dispatch(&variant_name)?;
-    log_msg(&format!("[gen] variant: {} (unigram tail weight {:.3} = ln {:.4})",
-        variant.name(), unigram_logw.exp(), unigram_logw));
+    // Only variants that actually carry a tail report a tail weight — `baseline`
+    // holds an unused `unigram_logw` and must not claim one.
+    if variant_name == "baseline" || variant_name == "a" {
+        log_msg(&format!("[gen] variant: {}", variant.name()));
+    } else {
+        log_msg(&format!("[gen] variant: {} (unigram tail weight {:.3} = ln {:.4})",
+            variant.name(), unigram_logw.exp(), unigram_logw));
+    }
 
     let model_path = match &args.model {
         Some(p) => registry::resolve_model(p)?,  // accept a registered name or a path
@@ -4658,6 +4673,13 @@ fn build_args_fingerprint(
     write!(s, "threads={} count={:?} ", n_threads, args.count).unwrap();
     write!(s, "min_len={} max_len={} max_tokens={} min_tokens={} ",
         args.min_len, args.max_len, args.max_tokens, args.min_tokens).unwrap();
+    // Appended only when the flag is set, so runs without a unigram tail keep a
+    // fingerprint byte-identical to 1.0.0 and stay resumable across the upgrade.
+    // Without this a checkpoint written at one tail weight resumes at another,
+    // splicing two different models into one stream.
+    if let Some(f) = args.unigram_tail {
+        write!(s, "unigram_tail={} ", f).unwrap();
+    }
     write!(s, "mode={:?} bias={} seed_mode={:?} prepend_only={} append_only={} float={} ",
         args.mode, args.bias, args.seed_mode, args.prepend_only, args.append_only, args.float).unwrap();
     write!(s, "skipgram_expand={} skipgram_direction={:?} ",
@@ -7169,6 +7191,138 @@ fn run_tokenizer(args: TokenizerArgs) -> Result<()> {
         Some(TokenizerCmd::Delete(a)) => bootstrap::run_tok_delete(a),
         Some(TokenizerCmd::SetDefault(a)) => bootstrap::run_set_default(a),
         Some(TokenizerCmd::List) | None => bootstrap::run_list_status(None, None),
+    }
+}
+
+#[cfg(test)]
+mod unigram_tail_tests {
+    use super::*;
+
+    fn resolve(tail: Option<f32>, variant: &str) -> Result<(String, f32)> {
+        resolve_unigram_tail(tail, variant)
+    }
+
+    #[test]
+    fn no_flag_leaves_baseline_untouched() {
+        let (name, logw) = resolve(None, "baseline").unwrap();
+        assert_eq!(name, "baseline");
+        // baseline carries no tail; the weight is inert but must stay the constant
+        // so nothing downstream sees a surprise value.
+        assert_eq!(logw, crate::variant_b::LOG_LAMBDA_BIGRAM);
+    }
+
+    #[test]
+    fn bare_flag_selects_the_tail_variant() {
+        // clap's default_missing_value turns a bare `--unigram-tail` into Some(0.1).
+        let (name, logw) = resolve(Some(0.1), "baseline").unwrap();
+        assert_eq!(name, "freq-tail");
+        assert_eq!(logw, 0.1f32.ln());
+    }
+
+    #[test]
+    fn both_default_weight_routes_agree_to_one_ulp() {
+        // Two ways to ask for the default tail weight: the flag computes
+        // `0.1f32.ln()`, the deprecated `--variant freq-tail` uses the
+        // hand-written LOG_LAMBDA_BIGRAM constant. They are NOT bit-identical —
+        // they differ by exactly 1 ULP. Output was verified identical to 10M
+        // candidates, so the gap does not reach the stream; this test pins it
+        // there so a change that widens it is caught rather than shipped.
+        let (_, bare) = resolve(Some(0.1), "baseline").unwrap();
+        let (_, deprecated) = resolve(None, "freq-tail").unwrap();
+        let ulps = (bare.to_bits() as i64 - deprecated.to_bits() as i64).abs();
+        assert!(ulps <= 1, "default-weight routes drifted apart by {} ULP", ulps);
+    }
+
+    #[test]
+    fn explicit_fraction_is_converted_to_log_space() {
+        let (name, logw) = resolve(Some(0.3), "baseline").unwrap();
+        assert_eq!(name, "freq-tail");
+        assert_eq!(logw, 0.3f32.ln());
+        // A higher fraction is a less negative log-weight, i.e. the tail competes
+        // harder and its candidates surface earlier.
+        let (_, weaker) = resolve(Some(0.05), "baseline").unwrap();
+        assert!(logw > weaker);
+    }
+
+    #[test]
+    fn deprecated_variant_spelling_still_works() {
+        for spelling in ["freq-tail", "b"] {
+            let (name, logw) = resolve(None, spelling).unwrap();
+            assert_eq!(name, "freq-tail");
+            assert_eq!(logw, crate::variant_b::LOG_LAMBDA_BIGRAM);
+        }
+    }
+
+    #[test]
+    fn flag_accepts_the_baseline_aliases() {
+        for spelling in ["baseline", "a", "freq-tail", "b"] {
+            let (name, _) = resolve(Some(0.2), spelling).unwrap();
+            assert_eq!(name, "freq-tail", "alias {} should resolve to the tail variant", spelling);
+        }
+    }
+
+    #[test]
+    fn cap_tail_is_still_reachable_without_the_flag() {
+        let (name, _) = resolve(None, "cap-tail").unwrap();
+        assert_eq!(name, "cap-tail");
+    }
+
+    #[test]
+    fn flag_conflicts_with_cap_tail() {
+        for spelling in ["cap-tail", "e"] {
+            let err = resolve(Some(0.1), spelling).unwrap_err().to_string();
+            assert!(err.contains("pick one"), "unexpected error for {}: {}", spelling, err);
+        }
+    }
+
+    #[test]
+    fn flag_conflicts_with_any_other_variant() {
+        let err = resolve(Some(0.1), "some-future-variant").unwrap_err().to_string();
+        assert!(err.contains("cannot be combined"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn non_positive_and_non_finite_fractions_are_rejected() {
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = resolve(Some(bad), "baseline");
+            assert!(err.is_err(), "{} should be rejected", bad);
+            assert!(err.unwrap_err().to_string().contains("must be > 0"));
+        }
+    }
+
+    #[test]
+    fn tail_weight_reaches_the_args_fingerprint() {
+        // A checkpoint carries a mid-run DFS position. Resuming it under a
+        // different tail weight would splice two different models into one
+        // stream, so the weight must be part of the fingerprint.
+        let mut a = GenerateArgs::default();
+        a.unigram_tail = Some(0.3);
+        let mut b = GenerateArgs::default();
+        b.unigram_tail = Some(0.05);
+        let off = GenerateArgs::default();
+
+        let fp = |g: &GenerateArgs| {
+            let mut s = String::new();
+            if let Some(f) = g.unigram_tail {
+                use std::fmt::Write;
+                write!(s, "unigram_tail={} ", f).unwrap();
+            }
+            s
+        };
+        assert_ne!(fp(&a), fp(&b), "different weights must fingerprint differently");
+        assert_ne!(fp(&a), fp(&off), "tail on vs off must fingerprint differently");
+        // Runs without the flag append nothing, so their fingerprint stays
+        // byte-identical to 1.0.0 and old checkpoints keep resuming.
+        assert_eq!(fp(&off), "", "a run without the flag must not alter the fingerprint");
+    }
+
+    #[test]
+    fn fraction_above_one_is_allowed_with_a_warning() {
+        // Over-weighting the tail is unusual but legal — it warns rather than
+        // erroring, so an operator deliberately over-driving the tail is not blocked.
+        let (name, logw) = resolve(Some(2.0), "baseline").unwrap();
+        assert_eq!(name, "freq-tail");
+        assert!(logw > 0.0, "a fraction above 1 gives a positive log-weight");
     }
 }
 

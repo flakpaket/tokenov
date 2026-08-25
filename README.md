@@ -331,6 +331,63 @@ Optimal chunk size is model-dependent: small-vocab models are merger-bound
 step dominates, so bigger chunks mostly add memory-copy pressure). The
 auto-tuner handles this — only pin a value after benchmarking your own model.
 
+#### The unigram tail (`--unigram-tail`)
+
+By default tokenov only proposes tokens it has actually seen following the
+current context. `--unigram-tail` additionally offers the most frequent tokens
+in the corpus at every step, letting the generator reach candidates its context
+statistics alone cannot — `oatmeal77` when `77` never followed `oatmeal` in
+training.
+
+Tail entries are weighted below the context tiers, so they surface once the
+better-supported options at a level are spent. They are **not** a fallback tier
+that only fires when the context runs dry — the context is essentially never
+dry. They compete on weight from the start, which is why the tail changes the
+stream early but gently.
+
+```bash
+tokenov generate --unigram-tail --count 1000000000        # default weight (0.1)
+tokenov generate --unigram-tail 0.3 --count 1000000000    # stronger tail
+```
+
+The optional `FRACTION` is the share of the bigram tier's missing-mass budget
+the tail receives. Higher means tail candidates surface earlier and more often.
+Omitting the flag disables the tail entirely; a bare `--unigram-tail` uses 0.1.
+
+**What it changes.** The effect is strongly depth-dependent. Measured against
+the default model on a 1-billion-candidate stream, the tail accounts for 0.005%
+of the stream in the first 10M candidates but 0.76% by 1B. Most of what it does
+is *reorder* rather than add: at 100M, new content is 0.23% of the stream while
+~7.8% of lines are positionally shifted. It also emits more duplicates than the
+default — 0.31% versus 0.007% per 1B — because the tail reaches the same string
+by several token paths. That is waste, not a defect.
+
+**When it is worth it.** Against slow hashes with no rule budget, a lot: +1.1%
+cracked at the head of a 1B stream and +145% deep into one. It is a
+generalization mechanism, so it pays off out-of-distribution — it won on 20 of
+21 cleartext corpora tested, the sole loss being the corpus the model was
+trained on.
+
+**When it is not.** Under a real rule set the advantage disappears: with
+`essential.rule` applied, the tail and the default are effectively tied. But
+they are *complementary* — each finds ~165k passwords the other never reaches,
+so running both and unioning the results beats either alone by ~4.7%. If you
+have a rule pipeline, that union is a better use of the budget than tuning the
+weight.
+
+**If you tune it, tune deep.** At 1e7 candidates the tail and the default differ
+by only a few hundred candidates, so a sweep calibrated there will read as
+inert. Calibrate at 1e9.
+
+**Limitations.** The flag has no effect on the graft generator
+(`--wordlist` with `--prepend-only` or `--float`), which ranks seeds by
+surprisal rather than sweeping the model's tiers. `score` and `calibrate` always
+use the default weight, so scores are not directly comparable to a stream
+generated with a non-default `FRACTION`.
+
+`--variant freq-tail` is the old spelling of a bare `--unigram-tail`. It still
+works and warns.
+
 #### Case shaping and enterprise (policy) mode
 
 Two flags reshape the emitted candidates at generation time:
@@ -526,7 +583,10 @@ produced by a HuggingFace tokenizer. Each context `(a, b)`'s trigram
 distribution sums to `(1 − λ(a,b))`; the remaining `λ(a,b)` mass flows
 to a bigram-continuation distribution `P_cont(t | b)` shared across all
 contexts ending in `b`. Special tokens (`START`, `END`) are integers
-above the tokenizer vocab size.
+above the tokenizer vocab size. With `--unigram-tail`, a third set of
+entries — the globally most frequent tokens — is appended to every
+context's child list, discounted by the tail weight, so they compete for
+emission alongside the context tiers rather than backing them off.
 
 **Enumeration**: an outer loop sweeps `target_level = 0, 1, 2, …`; an
 inner DFS visits all candidates at exactly that level and prunes
@@ -586,6 +646,7 @@ use `--json` to get the machine telemetry stream on stderr without `-v`.
 | `--max-len <N>` | maximum candidate length, post-decode bytes | 30 |
 | `--max-tokens <N>` | maximum tokens per heap-explored path | 12 |
 | `--min-tokens <N>` | minimum tokens per candidate (drop-at-emit floor; 1 = no-op) | 1 |
+| `--unigram-tail [FRACTION]` | also consider globally-frequent tokens at every step; FRACTION sets how strongly | (off; bare flag = 0.1) |
 | `--case-shape <SPEC>` | re-case each token (per-slot `?l`/`?c`/`?u`, or `lower`/`cap1`/`title`/`upper`; `;`-separated) | (off) |
 | `--enterprise` | emit only policy-compliant candidates (≥8 chars + ≥3 of 5 classes; capitalize-first repair) | (off) |
 | `--wordlist <PATH>` | OSINT/target wordlist (one entry per line) | (none → standard mode) |
