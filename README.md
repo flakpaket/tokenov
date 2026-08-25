@@ -276,9 +276,10 @@ universally.)
 Every fast-mode `generate` run is **resumable by default** — no `--output`
 required, so a killed `tokenov | hashcat` pipe can be picked back up.
 tokenov periodically checkpoints each worker's enumeration position to a
-rolling default state file (`$XDG_STATE_HOME/tokenov/generate.state`, else
-`~/.local/state/tokenov/generate.state`). After a kill, re-run the SAME
-command with `--resume`:
+state file **belonging to that run alone**
+(`$XDG_STATE_HOME/tokenov/sessions/<session-id>.ckpt`, else
+`~/.local/state/tokenov/sessions/…`). After a kill, re-run the SAME command
+with `--resume`:
 
 ```bash
 # original piped run — checkpointed automatically
@@ -289,15 +290,27 @@ tokenov generate --model m.ngram --count 1B --resume | hashcat -m 0 hashes.txt
 ```
 
 Each worker reconstructs its stack in O(depth) and continues, instead of
-re-enumerating from candidate 0. The resume validates that the model, args,
-`--threads`, and tokenov version all match the checkpoint (errors on
-mismatch rather than corrupting the stream). On clean completion the default
-state file is removed (nothing left to resume).
+re-enumerating from candidate 0. `--resume` locates the newest checkpoint
+whose fingerprint matches the current invocation — model, args, `--threads`
+and tokenov version all have to agree (it errors on a mismatch rather than
+corrupting the stream). On clean completion a run removes its own checkpoint;
+its session record stays in the ledger as history.
 
-To run several long tasks and return to a **specific** one, give each its own
-checkpoint with `--checkpoint-file <FILE>` (instead of the shared default),
-then resume that file with `--resume --checkpoint-file <FILE>` or
-`--resume-state <FILE>`. `--no-checkpoint` disables the state file entirely.
+**Per-run isolation is guaranteed.** A run only ever writes, reads or removes
+state carrying its own session id, so concurrent and unrelated runs cannot
+touch each other's resume state — not by convention, but because they never
+name the same file. (Through 1.0.0 every run shared one
+`$XDG_STATE_HOME/tokenov/generate.state`; a short unrelated run completing
+would delete a long run's position, and while both ran the short one
+overwrote it.) Resuming **appends** to `--output` and never truncates it: the
+saved position always lags durable output slightly, so a resume re-emits a
+short overlap rather than risking a gap.
+
+Every run already has its own checkpoint, so several long tasks coexist
+safely; `tokenov --sessions` (or `tokenov generate --sessions`) lists them and
+`--resume-session <ID>` returns to a specific one. `--checkpoint-file <FILE>`
+still pins a checkpoint to a path you choose, resumable with
+`--resume --checkpoint-file <FILE>` or `--resume-state <FILE>`. `--no-checkpoint` disables the state file entirely.
 `--checkpoint-secs` (default 300) sets the cadence, which is also the resume
 safety margin — the last checkpoint lags the crash, so resume re-tests a
 short overlap.
@@ -313,18 +326,22 @@ there's no saved position, and `--resume` falls back to re-running the
 deterministic stream and skipping the first N already-written candidates via
 the sidecar.
 
-#### Merge chunk size (strict mode only)
+#### Output batching
 
-`--merge-chunk-size` tunes the single-producer k-way merger used by
-`--strict`. Fast mode (the default) writes each thread's partition directly
-to the sink and has no merger, so this flag does nothing there. It batches
-emissions per merger draw to amortize per-item overhead; larger values raise
-throughput at the cost of a few items of imperfect ordering across chunks.
+`--merge-chunk-size`, `--no-auto-tune`, `--runtime-tune` and the
+`<model>.ngram.tune.toml` sidecar configure a k-way merger that **`generate`
+never runs**: fast mode writes each partition straight to the sink, and
+`--strict` is clamped to one thread and takes the direct-write path too.
+Passing them to `generate` warns and changes nothing; they apply to the
+hidden `calibrate` subcommand only.
 
-You rarely set it by hand. If it's unset, tokenov **auto-tunes** it during
-the run and records the best value in a `<model>.ngram.tune.toml` sidecar so
-future runs start from a good point; `--no-auto-tune` pins the built-in
-default (262144) instead.
+The knob that *is* live in fast mode is **`--flush-bytes`** (hidden, default
+65536): how many bytes a worker buffers before taking the shared output
+lock. Smaller means a finer interleave between partitions — output closer to
+rank order — larger means fewer lock acquisitions. Throughput is flat across
+the usable range because the sink's 8 MiB `BufWriter` already amortizes the
+syscalls, so this trades ordering granularity, not speed. It has no effect
+under `--strict` (single producer, nothing to interleave).
 
 Optimal chunk size is model-dependent: small-vocab models are merger-bound
 (bigger chunks help), while large-vocab models are producer-bound (the DFS
@@ -547,9 +564,8 @@ partition is internally rank-ordered, but items from different partitions
 land in scheduling order (a few thousand items out of place globally).
 
 **`--strict`** trades that parallelism for an exact global order: a single
-producer streams the full rank order through a k-way merger — a min-heap of
-`(level, sort_key)`-ordered chunks (size `--merge-chunk-size`) drained to
-the sink — giving a byte-reproducible, model-canonical stream. The merge is
+producer streams the full rank order straight to the sink, giving a
+byte-reproducible, model-canonical stream. The merge is
 inherently serial (one ordered output), so strict runs single-threaded;
 `--threads > 1` is ignored, and that costs no throughput versus a parallel
 merge. No temp files either way — output streams live to stdout or a file.
@@ -595,9 +611,10 @@ use `--json` to get the machine telemetry stream on stderr without `-v`.
 | `--mode <weighted\|seeded\|combined>` | legacy wordlist-targeting strategy (hidden) | (unset) |
 | `--bias <FLOAT>` | legacy: strength multiplier for W-tokens (weighted/combined; hidden) | 2.0 |
 | `--seed-mode <entry\|token>` | legacy: per-entry vs per-token seeding (hidden) | `entry` |
-| `--merge-chunk-size <N>` | strict mode only: items per merger chunk (auto-tunes if unset) | (auto-tune) |
+| `--merge-chunk-size <N>` | `calibrate` only — warns and does nothing on `generate` (no merger runs) | (unused) |
+| `--flush-bytes <BYTES>` | fast mode: bytes a worker buffers before taking the output lock (finer interleave when smaller; does not change the candidate set) | 65536 |
 | `--resume` | continue the previous run from its checkpoint, O(depth) (fast: no `--output` needed; strict: restores its DFS position + byte offset, needs `--output`; `--no-checkpoint` falls back to the re-run + skip-N sidecar) | (off) |
-| `--checkpoint-file <FILE>` | checkpoint to a named file instead of the rolling default (fast mode) | (default state file) |
+| `--checkpoint-file <FILE>` | checkpoint to a named path instead of this run's own session-id file | (per-run state file) |
 | `--no-checkpoint` | disable the default checkpoint state file (fast mode) | (off) |
 | `--checkpoint-secs <SEC>` | checkpoint cadence + resume safety margin | 300 |
 | `--resume-state <FILE>` | resume a specific checkpoint file (explicit form of `--resume`) | (none) |
