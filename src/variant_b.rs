@@ -37,10 +37,10 @@ pub struct B;
 impl Variant for B {
     fn name(&self) -> &'static str { "freq-tail" }
 
-    fn prepare(&self, model: &Model) -> EnumModel {
+    fn prepare(&self, model: &Model, unigram_logw: f32) -> EnumModel {
         // Trigram + bigram + log_lambda are identical to Variant A. Reuse
         // by delegating to Variant A's prepare, then add unigram_top.
-        let mut em = crate::variant_a::A.prepare(model);
+        let mut em = crate::variant_a::A.prepare(model, unigram_logw);
 
         // Build top-K raw-frequency unigram backoff list. Used by
         // get_children as a third tier after trigram + bigram. The
@@ -119,7 +119,7 @@ impl Variant for B {
                 let log_lam_ab = em.log_lambda.get(&ctx).copied().unwrap_or(0.0);
                 for &(id, lp_uni) in &em.unigram_top {
                     if !tri_seen.contains(&id) && !bi_seen.contains(&id) {
-                        out.push((id, log_lam_ab + LOG_LAMBDA_BIGRAM + lp_uni));
+                        out.push((id, log_lam_ab + em.unigram_logw + lp_uni));
                     }
                 }
             }
