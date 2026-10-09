@@ -514,18 +514,33 @@ struct GenerateArgs {
 
     /// Append affixes to the seed (seed stays the prefix, e.g. `cisco2024`).
     ///
-    /// This is the DEFAULT for --wordlist. Kept as an explicit flag for clarity;
-    /// mutually exclusive with --prepend-only / --float.
+    /// This is the DEFAULT for --wordlist, and this flag is simply its explicit
+    /// spelling — passing it changes nothing. Each seed becomes a prefix for the
+    /// Markov enumerator, so the full `generate` feature set applies (--strict,
+    /// --threads, --resume, --max-tokens, --min-level, --unigram-tail).
+    ///
+    /// Mutually exclusive with --prepend-only / --float.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     append_only: bool,
 
-    /// Prepend affixes instead (seed becomes the suffix, e.g. `ilovecisco`).
+    /// Prepend affixes instead (seed becomes the suffix, e.g. `lovecisco`).
+    ///
+    /// Runs the GRAFT generator (see --float), prepend side only.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     prepend_only: bool,
 
     /// Place affixes on EITHER side of the seed (rarity-weighted graft).
     ///
-    /// The pre-0.20 default. Mutually exclusive with --append-only / --prepend-only.
+    /// The pre-0.20 default. This and --prepend-only select the graft generator,
+    /// a different code path from the default --wordlist enumerator: seeds are
+    /// ranked rarest-first and combined with an affix pool, and a seed the
+    /// tokenizer split at word boundaries also contributes its words on their own
+    /// (`johnsmith` -> `john`, `smith`). It honors --count, --min-len/--max-len,
+    /// --min-tokens, --case-shape and --enterprise, but has no level sweep, no
+    /// worker threads and no checkpoint, so --strict / --threads / --max-tokens /
+    /// --min-level / --unigram-tail / --resume are rejected rather than ignored.
+    ///
+    /// Mutually exclusive with --append-only / --prepend-only, and with --mode.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     float: bool,
 
@@ -2842,6 +2857,51 @@ fn validate_min_level(min_level: u32, run_graft: bool, float: bool) -> Result<()
     Ok(())
 }
 
+/// Parse `--case-shape` into its patterns. Empty = default single lowercase
+/// emission (byte-identical to the prior path). Shared because the graft
+/// generator branches out of `run_generate` before the enumerator's own
+/// construction point.
+fn parse_case_masks(spec: &Option<String>) -> Result<Vec<CaseMask>> {
+    match spec {
+        Some(spec) => {
+            let m = CaseMask::parse_spec(spec).map_err(|e| anyhow::anyhow!(e))?;
+            log_msg(&format!("[gen] case-shape: {} pattern(s): [{}]", m.len(),
+                m.iter().map(|x| x.label.as_str()).collect::<Vec<_>>().join(", ")));
+            Ok(m)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Reject, rather than silently ignore, the `generate` flags that mean nothing
+/// to the graft generators (`--float` / `--prepend-only`).
+///
+/// Graft is not the level-sweep enumerator: it has no DFS to position, no worker
+/// threads to fan out, and no level sweep, so it writes no checkpoint and cannot
+/// resume. These flags used to be accepted and quietly dropped — a run would
+/// look like it honored `--strict` or `--resume` and had not. Same contract as
+/// `validate_min_level`. (`--enterprise` and `--case-shape` ARE honored by
+/// graft, so they are deliberately absent from this list.)
+fn validate_graft_flags(args: &GenerateArgs, run_graft: bool) -> Result<()> {
+    if !run_graft { return Ok(()); }
+    let flag = if args.float { "--float" } else { "--prepend-only" };
+    let mut bad: Vec<&str> = Vec::new();
+    if args.strict                    { bad.push("--strict"); }
+    if args.threads.is_some()         { bad.push("--threads"); }
+    if args.max_tokens != DEFAULT_MAX_TOKENS { bad.push("--max-tokens"); }
+    if args.resume                    { bad.push("--resume"); }
+    if args.resume_state.is_some()    { bad.push("--resume-state"); }
+    if args.checkpoint_file.is_some() { bad.push("--checkpoint-file"); }
+    if args.unigram_tail.is_some()    { bad.push("--unigram-tail"); }
+    if bad.is_empty() { return Ok(()); }
+    bail!("{} {} no effect with {} (that generator ranks seeds by surprisal \
+           instead of sweeping levels: single-threaded, no DFS to checkpoint or \
+           resume, no per-path token cap). Drop {} to use the enumerator instead.",
+        bad.join(", "),
+        if bad.len() == 1 { "has" } else { "have" },
+        flag, flag);
+}
+
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // `tokenov generate --sessions` / `--resume-session` behave exactly like the
     // top-level spellings instead of erroring (issue-064 item 6).
@@ -2884,16 +2944,28 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             args.min_tokens, args.max_tokens);
     }
     // A --wordlist defaults to APPEND-ONLY (seed stays the prefix, affixes
-    // appended) — the seeded walk, routed through the seeded machinery. The
+    // appended) — the seeded walk, routed through the seeded machinery, and
+    // --append-only is that default's explicit spelling (hence a no-op). The
     // graft generator (rarity-weighted, affixes on either side) is opt-in via
     // --float; --prepend-only is the prepend graft. --mode is the legacy opt-in
     // (weighted/seeded/combined).
     if [args.append_only, args.prepend_only, args.float].iter().filter(|&&x| x).count() > 1 {
         bail!("--append-only, --prepend-only, and --float are mutually exclusive");
     }
+    // The legacy --mode machinery and the graft generators are different code
+    // paths, and `run_graft` below requires `mode.is_none()`. Without this check
+    // `--float --mode seeded` silently discarded --float and ran the enumerator.
+    if args.mode.is_some() && (args.prepend_only || args.float) {
+        bail!("--mode (legacy) cannot be combined with {} — they select different \
+               generators. Drop --mode to use {}, or drop {} to use --mode.",
+            if args.float { "--float" } else { "--prepend-only" },
+            if args.float { "--float" } else { "--prepend-only" },
+            if args.float { "--float" } else { "--prepend-only" });
+    }
     let run_graft = args.wordlist.is_some() && args.mode.is_none()
         && (args.prepend_only || args.float);
     validate_min_level(args.min_level, run_graft, args.float)?;
+    validate_graft_flags(&args, run_graft)?;
     // Concrete mode for the legacy machinery + the graft generator's unbiased
     // model prep. None → Seeded (unbiased; --append-only is exactly seeded).
     let legacy_mode: Mode = args.mode.unwrap_or(Mode::Seeded);
@@ -3054,14 +3126,17 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     };
     let mut enum_model = variant.prepare(&post_bias_model, unigram_logw);
 
-    // Seed-chunk graft generator: the DEFAULT for --wordlist (unless a
-    // legacy --mode was requested, or --append-only). A self-contained path that
+    // Seed-chunk graft generator: OPT-IN via --float / --prepend-only. Bare
+    // --wordlist (and --append-only, its explicit spelling) does NOT come here —
+    // it runs the enumerator's seeded path below. A self-contained path that
     // reads the model + wordlist and emits rarity-weighted combinations directly,
     // bypassing the Markov enumerator. Branch here (before post_bias_model is
     // dropped) so it can read the model's unigram/decode tiers.
     if run_graft {
+        let graft_masks = parse_case_masks(&args.case_shape)?;
         return match &entry_seqs_opt {
-            Some(entry_seqs) => graft::run(&args, &enum_model, &post_bias_model, entry_seqs),
+            Some(entry_seqs) => graft::run(&args, &enum_model, &post_bias_model, entry_seqs,
+                &graft_masks),
             None => unreachable!("run_graft implies wordlist present"),
         };
     }
@@ -3304,15 +3379,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
 
     // Per-token case shaping. Empty = default single lowercase emission
     // (byte-identical to the prior path).
-    let case_masks: Vec<CaseMask> = match &args.case_shape {
-        Some(spec) => {
-            let m = CaseMask::parse_spec(spec).map_err(|e| anyhow::anyhow!(e))?;
-            log_msg(&format!("[gen] case-shape: {} pattern(s): [{}]", m.len(),
-                m.iter().map(|x| x.label.as_str()).collect::<Vec<_>>().join(", ")));
-            m
-        }
-        None => Vec::new(),
-    };
+    let case_masks: Vec<CaseMask> = parse_case_masks(&args.case_shape)?;
 
     // Single-thread direct-write path — no channels. This is the exact global
     // rank order and is byte-reproducible. Strict is clamped to one thread and
