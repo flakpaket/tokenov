@@ -1069,12 +1069,27 @@ struct Provenance {
     build_epoch: u64,
     /// tokenov binary version that built the model (`CARGO_PKG_VERSION`).
     binver: String,
+    /// Is the model's stored decode table byte-exact? (issue-074)
+    ///
+    /// False for every model written before the fix: `precompute_decode_table`
+    /// decoded one token at a time, so a token holding a fragment of a
+    /// multi-byte character was stored as U+FFFD. Absent in a pre-fix blob, and
+    /// `parse` defaults it to false — which is exactly right, since those are
+    /// the models that need repairing.
+    ///
+    /// This lives in the provenance blob rather than the file magic on purpose.
+    /// The blob is additive (readers stop at the fields they know), so a model
+    /// written today still loads on an older tokenov — and loads CORRECTLY,
+    /// because the fix is in the stored table that the old binary reads
+    /// verbatim. A new magic would have bought explicitness at the price of
+    /// every older binary refusing the file.
+    decode_exact: bool,
 }
 
 /// Provenance-blob schema version (inside the v3 header, distinct from the file
 /// magic). Bump when adding fields; readers skip trailing unknown bytes via the
 /// blob's outer length prefix, so older readers keep working.
-const PROVENANCE_SCHEMA: u32 = 1;
+const PROVENANCE_SCHEMA: u32 = 2;
 
 impl Provenance {
     /// Serialize the blob body (NOT including the outer u32 length prefix the
@@ -1094,6 +1109,9 @@ impl Provenance {
         put_str(&mut b, &self.train_path);
         put_u64(&mut b, self.build_epoch);
         put_str(&mut b, &self.binver);
+        // schema 2 (issue-074). Appended last so a schema-1 reader stops before
+        // it and is unaffected.
+        b.push(self.decode_exact as u8);
         b
     }
 
@@ -1126,7 +1144,10 @@ impl Provenance {
         let train_path = rd_str(&mut p, blob)?;
         let build_epoch = rd_u64(&mut p, blob)?;
         let binver = rd_str(&mut p, blob)?;
-        Ok(Provenance { tokenizer_json, tok_source, train_path, build_epoch, binver })
+        // schema 2 field. A schema-1 blob simply ends here; false is the correct
+        // reading for it (its table predates the fix).
+        let decode_exact = blob.get(p).is_some_and(|b| *b != 0);
+        Ok(Provenance { tokenizer_json, tok_source, train_path, build_epoch, binver, decode_exact })
     }
 }
 
@@ -1372,6 +1393,44 @@ fn model_load(path: &Path) -> Result<Model> {
     }
     let fmt = if magic == MODEL_MAGIC_V3 { "v3/KN+prov" }
               else if is_kn { "v2/KN" } else { "v1" };
+
+    // issue-074: a model written before the fix carries a decode table built one
+    // token at a time, so every token holding a fragment of a multi-byte
+    // character was stored as U+FFFD. The loss is in the FILE, so no
+    // decode-time choice can undo it — the table has to be rebuilt. The
+    // provenance blob says whether it needs that; a pre-fix blob has no such
+    // field and `parse` reads it as false, which is the right answer for it.
+    //
+    // A v3 model embeds the exact tokenizer it was built with, so it is fully
+    // repairable here with no retrain (~120 ms, tokenizer parse dominating).
+    // v1/v2 embed nothing and can only be warned about.
+    let prov = model_read_provenance(path).ok().flatten();
+    let decode = if prov.as_ref().is_some_and(|p| p.decode_exact) {
+        decode
+    } else {
+        match prov.as_ref().and_then(|p| rebuild_decode_table(p, decode.len())) {
+            Some(fixed) => {
+                warn_msg(&format!(
+                    "note: {} has a decode table predating the issue-074 fix; rebuilt it in \
+                     memory from the model's own embedded tokenizer. Output is correct. \
+                     Retrain with `tokenov model train` to store it fixed and skip this.",
+                    path.display()));
+                fixed
+            }
+            None => {
+                if decode.iter().any(|e| e.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD])) {
+                    warn_msg(&format!(
+                        "warning: {} is {} and carries a decode table predating the issue-074 \
+                         fix. Candidates containing a multi-byte character may be emitted with \
+                         U+FFFD in place of the real bytes. This format embeds no tokenizer, so \
+                         it cannot be repaired automatically — retrain with \
+                         `tokenov model train` to fix it.", path.display(), fmt));
+                }
+                decode
+            }
+        }
+    };
+
     log_msg(&format!("[load] {} ({} ctx, {} MB, {}) in {:.1}s",
         path.display(), n_ctx, bytes.len() / 1_000_000, fmt,
         t0.elapsed().as_secs_f64()));
@@ -1379,6 +1438,20 @@ fn model_load(path: &Path) -> Result<Model> {
         contexts, decode, start_id, end_id,
         is_kn, discount, lambda, bigram_kn, unigram_raw, unigram_kn_cont,
     })
+}
+
+/// Rebuild a model's decode table from the tokenizer embedded in its provenance.
+///
+/// `Some` only when the blob's tokenizer parses and yields a table describing
+/// the same vocabulary; the result is then exactly what a post-fix build of the
+/// same model would have written. `None` leaves the caller with the stored table
+/// (and a warning) — the v1/v2 case, which embeds no tokenizer at all.
+fn rebuild_decode_table(prov: &Provenance, vocab_size: usize) -> Option<Vec<Vec<u8>>> {
+    let tokenizer = Tokenizer::from_bytes(&prov.tokenizer_json).ok()?;
+    let kind = classify_tokenizer(&tokenizer);
+    let fixed = precompute_decode_table(&tokenizer, vocab_size as u32, kind).ok()?;
+    // Refuse a vocabulary mismatch rather than silently renumbering candidates.
+    (fixed.len() == vocab_size).then_some(fixed)
 }
 
 // ============================================================================
@@ -1408,14 +1481,103 @@ fn classify_tokenizer(tokenizer: &Tokenizer) -> DecodeKind {
     DecodeKind::Plain
 }
 
+/// GPT-2's byte-level alphabet, as a reverse (char -> byte) map.
+///
+/// Byte-level BPE vocabularies are stored as *text*: each of the 256 byte values
+/// is written as one printable Unicode char. Reversing that is the only way to
+/// recover a token's raw bytes. Reimplemented here because `tokenizers`' own
+/// `bytes_char()` is `pub(crate)`; the algorithm is fixed and standard (verbatim
+/// from `tokenizers/src/pre_tokenizers/byte_level.rs`, itself GPT-2's
+/// `bytes_to_unicode`), so there is nothing to keep in sync.
+fn byte_level_char_to_byte() -> FxHashMap<char, u8> {
+    let mut bs: Vec<u8> = Vec::with_capacity(256);
+    bs.extend(b'!'..=b'~');
+    bs.extend(b'\xA1'..=b'\xAC');
+    bs.extend(b'\xAE'..=b'\xFF');
+    let mut cs: Vec<u32> = bs.iter().map(|b| *b as u32).collect();
+    let mut n = 0u32;
+    for b in 0..=255u8 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(256 + n);
+            n += 1;
+        }
+    }
+    bs.into_iter()
+        .zip(cs)
+        .filter_map(|(b, c)| char::from_u32(c).map(|c| (c, b)))
+        .collect()
+}
+
+/// The raw bytes a byte-level token stands for.
+///
+/// Mirrors `ByteLevel::decode_chain`, including its fallback: a token whose
+/// chars are not all in the alphabet (added/special tokens such as
+/// `<|endoftext|>`) yields its own UTF-8 bytes.
+fn byte_level_token_bytes(tok: &str, c2b: &FxHashMap<char, u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(tok.len());
+    for c in tok.chars() {
+        match c2b.get(&c) {
+            Some(&b) => out.push(b),
+            None => return tok.as_bytes().to_vec(),
+        }
+    }
+    out
+}
+
+/// Is this vocabulary written in the byte-level alphabet?
+///
+/// This is the precondition for recovering a token's raw bytes, and it is a
+/// different question from `DecodeKind` (which is only about space handling).
+/// Testing alphabet membership answers it directly; the old `0xC4 0xA0` probe in
+/// `classify_tokenizer` does not — a tokenizer that *has* a ByteLevel decoder
+/// returns `" "` rather than `"Ġ"` from `decode`, so byte-level vocabularies
+/// were being classified `Plain` and taking the lossy path (issue-074).
+fn is_byte_level_vocab(tokenizer: &Tokenizer) -> bool {
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+    let alphabet = ByteLevel::alphabet();
+    let n = tokenizer.get_vocab_size(false).min(2048) as u32;
+    let (mut checked, mut inside) = (0usize, 0usize);
+    for id in 0..n {
+        let Some(tok) = tokenizer.id_to_token(id) else { continue };
+        if tok.is_empty() { continue; }
+        checked += 1;
+        if tok.chars().all(|c| alphabet.contains(&c)) { inside += 1; }
+    }
+    // SentencePiece vocabularies carry `▁` (U+2581), outside the alphabet, so
+    // they fail this. A small tail of added tokens is tolerated.
+    checked > 0 && inside * 100 >= checked * 95
+}
+
+/// Build the per-token decode table that gets serialised into the model.
+///
+/// issue-074: this used to call `tokenizer.decode(&[id], true)` per id. A
+/// byte-level BPE token can hold a *fragment* of a multi-byte character, which
+/// is not valid UTF-8 alone, so `tokenizers` substituted U+FFFD and the loss was
+/// written into the model file permanently (352 of 50257 entries on
+/// `tokenov_v1`). The table is `Vec<Vec<u8>>` — raw bytes — so the fix is to
+/// reverse the byte-level alphabet ourselves and never let UTF-8 validation see
+/// a partial character.
+///
+/// The two axes are kept separate on purpose: `is_byte_level_vocab` decides how
+/// to get a token's BYTES, `kind` decides the SPACE policy. Space handling is
+/// deliberately unchanged, so this fix moves only the bytes.
 fn precompute_decode_table(tokenizer: &Tokenizer, vocab_size: u32, kind: DecodeKind) -> Result<Vec<Vec<u8>>> {
     let mut table: Vec<Vec<u8>> = Vec::with_capacity(vocab_size as usize);
+    let c2b = is_byte_level_vocab(tokenizer).then(byte_level_char_to_byte);
     for id in 0..vocab_size {
-        let s = tokenizer.decode(&[id], true).unwrap_or_default();
+        // Bytes: reverse the byte-level alphabet when we can, else fall back to
+        // the library decode (SentencePiece-style vocabularies).
+        let raw = match &c2b {
+            Some(c2b) => byte_level_token_bytes(&tokenizer.id_to_token(id).unwrap_or_default(), c2b),
+            None => tokenizer.decode(&[id], true).unwrap_or_default().into_bytes(),
+        };
+        // Space policy: unchanged from before this fix.
         let bytes = match kind {
-            DecodeKind::Plain => s.into_bytes(),
+            DecodeKind::Plain => raw,
             DecodeKind::StripBpeSpace => {
-                let raw = s.as_bytes();
+                // Strip ASCII space and, for a vocabulary we could not reverse,
+                // the literal 'Ġ' (0xC4 0xA0) it would still be spelled with.
                 let mut out = Vec::with_capacity(raw.len());
                 let mut i = 0;
                 while i < raw.len() {
@@ -1765,6 +1927,9 @@ fn run_build(args: BuildArgs) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs()).unwrap_or(0),
             binver: env!("CARGO_PKG_VERSION").to_string(),
+            // This build's `precompute_decode_table` recovers raw bytes, so the
+            // table it just wrote is byte-exact (issue-074).
+            decode_exact: true,
         }),
         Err(e) => {
             warn_msg(&format!("[build] warning: could not read tokenizer to embed ({e}); \
@@ -7412,6 +7577,13 @@ fn run_model_info(args: InfoArgs) -> Result<()> {
                 .map(|t| t.get_vocab_size(false).to_string())
                 .unwrap_or_else(|_| "<unreadable>".to_string());
             println!("format:            NGRMv003 (self-describing)");
+            if prov.decode_exact {
+                println!("decode table:      byte-exact");
+            } else {
+                println!("decode table:      pre-issue-074 (multi-byte tokens stored as U+FFFD);");
+                println!("                   repaired in memory at load from the embedded tokenizer.");
+                println!("                   Retrain with `tokenov model train` to store it fixed.");
+            }
             println!("tokenizer:         embedded, {} bytes, vocab_size {}",
                 prov.tokenizer_json.len(), vocab);
             println!("tokenizer source:  {}", prov.tok_source);
@@ -7421,6 +7593,8 @@ fn run_model_info(args: InfoArgs) -> Result<()> {
         }
         None => {
             println!("format:            NGRMv001/002 (older format — no embedded tokenizer)");
+            println!("decode table:      pre-issue-074 and NOT repairable (no embedded tokenizer):");
+            println!("                   multi-byte characters may emit as U+FFFD. Rebuild to fix.");
             println!("note:              built by an older tokenov; the tokenizer is not embedded.");
             println!("                   Rebuild with a current tokenov to embed it, or for");
             println!("                   --wordlist mode supply the tokenizer via TOKENOV_TOKENIZER");
@@ -7640,6 +7814,120 @@ mod unigram_tail_tests {
 }
 
 #[cfg(test)]
+mod decode_table_tests {
+    use super::*;
+
+    const BUNDLED: &[u8] = include_bytes!("../tokenizers/tokenov_v1/tokenizer.json");
+
+    fn bundled() -> Tokenizer {
+        Tokenizer::from_bytes(BUNDLED).expect("bundled tokenizer must load")
+    }
+
+    /// Built exactly as `model train` builds it — via the real classifier, not a
+    /// hardcoded kind. tokenov_v1 classifies `Plain` (it has a ByteLevel
+    /// decoder, so the `Ġ` probe misses), which is precisely the path that was
+    /// losing bytes.
+    fn bundled_table() -> Vec<Vec<u8>> {
+        let t = bundled();
+        let v = t.get_vocab_size(false) as u32;
+        precompute_decode_table(&t, v, classify_tokenizer(&t)).unwrap()
+    }
+
+    #[test]
+    fn bundled_vocab_is_detected_as_byte_level() {
+        assert!(is_byte_level_vocab(&bundled()),
+            "tokenov_v1 is byte-level BPE; without this the raw-byte path is skipped");
+    }
+
+    #[test]
+    fn byte_level_map_covers_every_byte_uniquely() {
+        let c2b = byte_level_char_to_byte();
+        assert_eq!(c2b.len(), 256, "every byte needs exactly one char");
+        let mut seen = [false; 256];
+        for (_, &b) in c2b.iter() { seen[b as usize] = true; }
+        assert!(seen.iter().all(|&x| x), "map must be onto all 256 bytes");
+        // The space marker `Ġ` is U+0120 = 256 + 32 — the entry the old
+        // `0xC4 0xA0` special case was hand-decoding.
+        assert_eq!(c2b.get(&'\u{0120}'), Some(&b' '));
+    }
+
+    /// issue-074: the regression that matters. A byte-level vocab has a token for
+    /// every one of the 256 byte values; each must decode to exactly that byte.
+    /// Before the fix the 0x80..=0xFF and control-byte tokens all decoded to
+    /// U+FFFD instead (352 of 50257 entries on this vocab were corrupted).
+    #[test]
+    fn every_single_byte_token_decodes_to_its_own_byte() {
+        let t = bundled();
+        let table = bundled_table();
+        let c2b = byte_level_char_to_byte();
+        let b2c: FxHashMap<u8, char> = c2b.iter().map(|(&c, &b)| (b, c)).collect();
+        for b in 0..=255u8 {
+            let tok: String = b2c[&b].to_string();
+            let id = t.token_to_id(&tok).unwrap_or_else(|| panic!("no token for byte {b:#04x}"));
+            let got = &table[id as usize];
+            assert_eq!(got, &vec![b], "byte {b:#04x} must decode to itself");
+        }
+    }
+
+    /// U+FFFD may still appear, but ONLY where the vocabulary genuinely has a
+    /// token for the `�` character (GPT-2 was trained on web text full of
+    /// mojibake, so `ï¿½` is a real token). Those are correct; what must never
+    /// happen again is U+FFFD standing in for a byte it could not represent.
+    #[test]
+    fn replacement_char_only_from_genuine_replacement_tokens() {
+        let t = bundled();
+        for (i, e) in bundled_table().iter().enumerate() {
+            if e.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]) {
+                let tok = t.id_to_token(i as u32).unwrap_or_default();
+                assert!(tok.contains("ï¿½"),
+                    "id {i} decoded to U+FFFD but its token {tok:?} does not spell one");
+            }
+        }
+    }
+
+    /// The space marker must never survive in its *encoded* spelling. Under the
+    /// StripBpeSpace policy it is removed entirely; under Plain (what
+    /// tokenov_v1 uses) it becomes a real 0x20, which is the pre-existing
+    /// behaviour this fix deliberately does not change.
+    #[test]
+    fn space_marker_is_never_left_encoded() {
+        for e in bundled_table() {
+            assert!(!e.windows(2).any(|w| w == [0xC4, 0xA0]), "Ġ leaked encoded: {e:?}");
+        }
+        let t = bundled();
+        let v = t.get_vocab_size(false) as u32;
+        let stripped = precompute_decode_table(&t, v, DecodeKind::StripBpeSpace).unwrap();
+        for e in stripped {
+            assert!(!e.contains(&b' '), "StripBpeSpace must drop raw spaces: {e:?}");
+        }
+    }
+
+    /// The conclusive check: encode a string, concatenate the table entries for
+    /// its ids, and require the original bytes back. These are the CeWL entries
+    /// that exposed the bug (Armenian, CJK, Hangul, Cyrillic, Latin-1).
+    #[test]
+    fn whole_vocab_round_trips_multibyte_text() {
+        let t = bundled();
+        let table = bundled_table();
+        for s in [
+            "\u{fb}t\u{531}CXvvIJYZYT",   // ûtԱCXvvIJYZYT — the reported case
+            "yEbzJNOU\u{4826}",            // CJK
+            "o\u{c0ad}TVLy\u{c650}f",     // Hangul
+            "D\u{119}dxbV\u{432}Njyse",   // Cyrillic
+            "caf\u{e9}latte",              // single-token é (worked before)
+            "Responsibility2024",           // plain ASCII
+        ] {
+            let enc = t.encode(s, false).unwrap();
+            let mut got: Vec<u8> = Vec::new();
+            for &id in enc.get_ids() {
+                got.extend_from_slice(&table[id as usize]);
+            }
+            assert_eq!(got, s.as_bytes(), "round-trip failed for {s:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod prov_tests {
     use super::*;
 
@@ -7651,6 +7939,7 @@ mod prov_tests {
             train_path: "/data/rockyou_train_freq.txt".to_string(),
             build_epoch: 1_785_459_182,
             binver: "0.18.0".to_string(),
+            decode_exact: true,
         };
         let blob = p.serialize();
         let q = Provenance::parse(&blob).expect("parse");
@@ -7669,7 +7958,7 @@ mod prov_tests {
         let p = Provenance {
             tokenizer_json: vec![1, 2, 3, 4],
             tok_source: "t".into(), train_path: "r".into(),
-            build_epoch: 42, binver: "0.18.0".into(),
+            build_epoch: 42, binver: "0.18.0".into(), decode_exact: true,
         };
         let mut blob = p.serialize();
         blob.extend_from_slice(b"\x07\x00\x00\x00FUTUREF"); // a bogus future field
@@ -7678,12 +7967,34 @@ mod prov_tests {
         assert_eq!(q.binver, "0.18.0");
     }
 
+    /// issue-074's compatibility hinge: a blob written before the fix has no
+    /// `decode_exact` field, and must read back as false so the loader repairs
+    /// it. Simulated by truncating the flag byte off a serialised blob — exactly
+    /// what a schema-1 writer produced.
+    #[test]
+    fn missing_decode_exact_reads_as_false() {
+        let p = Provenance {
+            tokenizer_json: vec![1, 2, 3],
+            tok_source: "t".into(), train_path: "r".into(),
+            build_epoch: 7, binver: "1.1.0".into(), decode_exact: true,
+        };
+        let blob = p.serialize();
+        let old_style = &blob[..blob.len() - 1]; // drop the schema-2 flag byte
+        let q = Provenance::parse(old_style).expect("a schema-1 blob must still parse");
+        assert_eq!(q.binver, "1.1.0", "known fields must survive");
+        assert!(!q.decode_exact, "a pre-fix model must not claim a byte-exact table");
+        // And a schema-2 blob round-trips the flag in both states.
+        assert!(Provenance::parse(&blob).unwrap().decode_exact);
+        let q2 = Provenance { decode_exact: false, ..p };
+        assert!(!Provenance::parse(&q2.serialize()).unwrap().decode_exact);
+    }
+
     #[test]
     fn empty_tokenizer_bytes_round_trip() {
         let p = Provenance {
             tokenizer_json: Vec::new(),
             tok_source: String::new(), train_path: String::new(),
-            build_epoch: 0, binver: String::new(),
+            build_epoch: 0, binver: String::new(), decode_exact: false,
         };
         let q = Provenance::parse(&p.serialize()).expect("parse");
         assert!(q.tokenizer_json.is_empty());
@@ -7695,7 +8006,7 @@ mod prov_tests {
         let p = Provenance {
             tokenizer_json: vec![9; 32],
             tok_source: "x".into(), train_path: "y".into(),
-            build_epoch: 1, binver: "z".into(),
+            build_epoch: 1, binver: "z".into(), decode_exact: true,
         };
         let blob = p.serialize();
         // Chop the blob mid-field: parse must return Err, never panic/OOB.
@@ -7796,3 +8107,5 @@ mod min_level_tests {
         assert!(validate_min_level(0,  true, true).is_ok());    // unset ⇒ no conflict
     }
 }
+
+

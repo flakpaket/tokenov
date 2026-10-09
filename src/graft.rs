@@ -304,9 +304,10 @@ impl<'a> Emitter<'a> {
     }
 }
 
-/// Entry point for the default --wordlist graft generator. Emits rarity-weighted combinations:
-/// rarest seed first; per-seed and per-chunk budget ∝ surprisal; each anchor
-/// combined with the affix pool (+ other seeds' distinctive chunks for mixing).
+/// Entry point for the graft generator (`--float` / `--prepend-only`, NOT the
+/// `--wordlist` default). Emits rarity-weighted combinations: rarest seed first;
+/// per-seed and per-chunk budget ∝ surprisal; each anchor combined with the
+/// affix pool (+ other seeds' distinctive chunks for mixing).
 pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec<u32>],
            case_masks: &[CaseMask]) -> Result<()> {
     let start_id = model.start_id;
