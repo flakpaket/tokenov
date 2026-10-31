@@ -5,6 +5,67 @@ All notable changes to tokenov are recorded here. Versions follow
 or model format, MINOR for new opt-in surface with unchanged default output,
 PATCH for fixes.
 
+## 1.2.0 — unreleased
+
+Fixes non-ASCII candidates and three `--wordlist` defects. **Default output
+changes, but only on lines that were already broken.** These are candidates
+containing a token that 1.1.0 rendered as U+FFFD (`�`); every pure-ASCII
+candidate is unchanged (see "Release gate").
+
+### Fixed
+
+- **Non-ASCII candidates are byte-exact.** The model's decode table was built
+  one token at a time. A byte-level BPE token holding part of a multi-byte
+  character is not valid UTF-8 on its own, so it was stored as U+FFFD. That is
+  352 of 50,257 entries in the default model. As a result:
+  - `--float` / `--prepend-only` emitted `�` in place of the seed's real
+    characters, e.g. `ûtԱCXvvIJYZYT` came back as `ût��CXvvIJYZYT`.
+  - Standard mode emitted junk such as `��`.
+
+  The table now stores each token's raw bytes. Existing models do not need
+  retraining: a model built before 1.2.0 is repaired in memory at load from its
+  embedded tokenizer, and tokenov prints a one-line note. `model info` reports
+  which kind of table a model has. Models remain `NGRMv003`; the provenance
+  blob gains an additive `decode_exact` flag (schema 2). Older releases ignore
+  the flag, still load 1.2.0 models, and read the corrected table as stored.
+- **`--count` is a ceiling under `--float` / `--prepend-only`.** Each seed and
+  sub-chunk was given at least one candidate and nothing checked the total, so
+  a 200-entry wordlist with `-c 10` emitted 200. Budgets are now apportioned
+  exactly and the total is enforced.
+- **Graft seed splitting keeps words, not fragments.** Sub-chunks were admitted
+  for being rare. The rarest pieces are mid-word BPE splits, so `cisco` gave
+  `isco` and `summer` gave `sum` / `mer`, while `northwind` lost `wind`. A seed
+  is now split only when every piece is at least 3 characters, and pieces of 4+
+  characters become anchors (`johnsmith` → `john`, `smith`).
+- **`--enterprise` and `--case-shape` work under `--float` / `--prepend-only`.**
+  They were accepted and ignored.
+
+### Changed
+
+- **Graft says which flags it ignores.** `--strict`, `--threads`,
+  `--max-tokens`, `--unigram-tail`, `--resume`, `--resume-state` and
+  `--checkpoint-file` have never had any effect with `--float` /
+  `--prepend-only`, and were accepted silently. They now print a warning naming
+  the ignored flags. Output is byte-identical to running without them, so
+  existing scripts keep working. `--min-level` remains an error there, as in
+  1.1.0.
+- **`--mode` with `--float` / `--prepend-only` is an error.** It previously
+  discarded `--float` / `--prepend-only` without saying so and ran a different
+  generator.
+- **Output is no longer guaranteed valid UTF-8.** Candidates are the tokens'
+  exact bytes. 1.1.0's output was always valid UTF-8 because every partial
+  character had been replaced with `�`. Read output as bytes.
+
+### Documentation
+
+- README explains that the default / `--append-only` path and `--float` /
+  `--prepend-only` are two different generators, and what each supports.
+- README documents the decode-table repair and the `decode_exact` flag.
+
+### Release gate
+
+_Pending._
+
 ## 1.1.0 — 2026-09-02
 
 Two new generation controls and four fixes. **Default output is unchanged from

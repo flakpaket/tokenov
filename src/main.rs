@@ -537,8 +537,9 @@ struct GenerateArgs {
     /// tokenizer split at word boundaries also contributes its words on their own
     /// (`johnsmith` -> `john`, `smith`). It honors --count, --min-len/--max-len,
     /// --min-tokens, --case-shape and --enterprise, but has no level sweep, no
-    /// worker threads and no checkpoint, so --strict / --threads / --max-tokens /
-    /// --min-level / --unigram-tail / --resume are rejected rather than ignored.
+    /// worker threads and no checkpoint: --min-level is an error, and --strict /
+    /// --threads / --max-tokens / --unigram-tail / --resume / --resume-state /
+    /// --checkpoint-file warn and are ignored.
     ///
     /// Mutually exclusive with --append-only / --prepend-only, and with --mode.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
@@ -3038,33 +3039,41 @@ fn parse_case_masks(spec: &Option<String>) -> Result<Vec<CaseMask>> {
     }
 }
 
-/// Reject, rather than silently ignore, the `generate` flags that mean nothing
-/// to the graft generators (`--float` / `--prepend-only`).
+/// Warn about, then clear, the `generate` flags that mean nothing to the graft
+/// generators (`--float` / `--prepend-only`).
 ///
 /// Graft is not the level-sweep enumerator: it has no DFS to position, no worker
 /// threads to fan out, and no level sweep, so it writes no checkpoint and cannot
-/// resume. These flags used to be accepted and quietly dropped — a run would
-/// look like it honored `--strict` or `--resume` and had not. Same contract as
-/// `validate_min_level`. (`--enterprise` and `--case-shape` ARE honored by
-/// graft, so they are deliberately absent from this list.)
-fn validate_graft_flags(args: &GenerateArgs, run_graft: bool) -> Result<()> {
-    if !run_graft { return Ok(()); }
+/// resume. These flags used to be accepted and dropped without a word, so a run
+/// looked like it honored `--strict` or `--resume` when it had not. They now
+/// warn instead. They are not errors because old scripts must keep running (the
+/// retired-flag convention, cf. `--skipgram-expand`), and verified inert on
+/// 1.1.0, so ignoring them reproduces 1.1.0's output exactly. Each one is
+/// cleared after the warning so nothing downstream can act on it.
+/// (`--enterprise` and `--case-shape` ARE honored by graft, so they are absent
+/// from this list; `--min-level` stays an error, as it was in 1.1.0.)
+fn ignore_graft_flags(args: &mut GenerateArgs, run_graft: bool) {
+    if !run_graft { return; }
     let flag = if args.float { "--float" } else { "--prepend-only" };
     let mut bad: Vec<&str> = Vec::new();
-    if args.strict                    { bad.push("--strict"); }
-    if args.threads.is_some()         { bad.push("--threads"); }
-    if args.max_tokens != DEFAULT_MAX_TOKENS { bad.push("--max-tokens"); }
-    if args.resume                    { bad.push("--resume"); }
-    if args.resume_state.is_some()    { bad.push("--resume-state"); }
-    if args.checkpoint_file.is_some() { bad.push("--checkpoint-file"); }
-    if args.unigram_tail.is_some()    { bad.push("--unigram-tail"); }
-    if bad.is_empty() { return Ok(()); }
-    bail!("{} {} no effect with {} (that generator ranks seeds by surprisal \
-           instead of sweeping levels: single-threaded, no DFS to checkpoint or \
-           resume, no per-path token cap). Drop {} to use the enumerator instead.",
+    if args.strict                    { bad.push("--strict");          args.strict = false; }
+    if args.threads.is_some()         { bad.push("--threads");         args.threads = None; }
+    if args.max_tokens != DEFAULT_MAX_TOKENS { bad.push("--max-tokens"); args.max_tokens = DEFAULT_MAX_TOKENS; }
+    if args.resume                    { bad.push("--resume");          args.resume = false; }
+    if args.resume_state.is_some()    { bad.push("--resume-state");    args.resume_state = None; }
+    if args.checkpoint_file.is_some() { bad.push("--checkpoint-file"); args.checkpoint_file = None; }
+    if args.unigram_tail.is_some()    { bad.push("--unigram-tail");    args.unigram_tail = None; }
+    if bad.is_empty() { return; }
+    warn_msg(&format!("warning: {} {} no effect with {} and {} ignored (that generator \
+           ranks seeds by surprisal instead of sweeping levels: single-threaded, no DFS \
+           to checkpoint or resume, no per-path token cap). Drop {} to use the \
+           enumerator, which honors {}.",
         bad.join(", "),
         if bad.len() == 1 { "has" } else { "have" },
-        flag, flag);
+        flag,
+        if bad.len() == 1 { "is" } else { "are" },
+        flag,
+        if bad.len() == 1 { "it" } else { "them" }));
 }
 
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
@@ -3130,7 +3139,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     let run_graft = args.wordlist.is_some() && args.mode.is_none()
         && (args.prepend_only || args.float);
     validate_min_level(args.min_level, run_graft, args.float)?;
-    validate_graft_flags(&args, run_graft)?;
+    ignore_graft_flags(&mut args, run_graft);
     // Concrete mode for the legacy machinery + the graft generator's unbiased
     // model prep. None → Seeded (unbiased; --append-only is exactly seeded).
     let legacy_mode: Mode = args.mode.unwrap_or(Mode::Seeded);
@@ -8105,6 +8114,48 @@ mod min_level_tests {
         assert!(validate_min_level(30, true, true).is_err());   // --float
         assert!(validate_min_level(30, true, false).is_err());  // --prepend-only
         assert!(validate_min_level(0,  true, true).is_ok());    // unset ⇒ no conflict
+    }
+}
+
+#[cfg(test)]
+mod graft_flag_tests {
+    use super::{ignore_graft_flags, Cli, GenerateArgs, DEFAULT_MAX_TOKENS};
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> GenerateArgs {
+        let mut v = vec!["tokenov", "--wordlist", "w.txt"];
+        v.extend_from_slice(extra);
+        Cli::try_parse_from(v).expect("parse").generate_args
+    }
+
+    const ALL: &[&str] = &["--strict", "--threads", "3", "--max-tokens", "6", "--resume",
+        "--resume-state", "s.ckpt", "--checkpoint-file", "c.ckpt", "--unigram-tail", "0.3"];
+
+    /// On the graft path the seven flags are cleared (after a warning), so no
+    /// later code can act on them — 1.1.0 ignored them silently, and this keeps
+    /// its output while saying so.
+    #[test]
+    fn graft_clears_flags_it_cannot_honor() {
+        for g in ["--float", "--prepend-only"] {
+            let mut a = parse(&[&[g][..], ALL].concat());
+            ignore_graft_flags(&mut a, true);
+            assert!(!a.strict && !a.resume, "{g}");
+            assert!(a.threads.is_none() && a.resume_state.is_none(), "{g}");
+            assert!(a.checkpoint_file.is_none() && a.unigram_tail.is_none(), "{g}");
+            assert_eq!(a.max_tokens, DEFAULT_MAX_TOKENS, "{g}");
+        }
+    }
+
+    /// The enumerator path honors every one of these, so it must not touch them.
+    #[test]
+    fn enumerator_path_keeps_flags() {
+        let mut a = parse(ALL);
+        ignore_graft_flags(&mut a, false);
+        assert!(a.strict && a.resume);
+        assert_eq!(a.threads, Some(3));
+        assert_eq!(a.max_tokens, 6);
+        assert!(a.resume_state.is_some() && a.checkpoint_file.is_some());
+        assert_eq!(a.unigram_tail, Some(0.3));
     }
 }
 
