@@ -64,7 +64,35 @@ candidate is unchanged (see "Release gate").
 
 ### Release gate
 
-_Pending._
+1.1.0 versus this release, six 1e9 streams on default arguments, cracked against
+rockyou (99,998 hashes) and enterprise_union (83,867) at 1e7/1e8/1e9.
+
+Default output was expected to change, so the test is that it changes **only**
+where the decode fix says it should:
+
+| configuration | pure-ASCII candidates | lines only in 1.1.0 |
+|---|---|---|
+| `--strict` | 1.1.0's are an exact, in-order prefix of 1.2.0's | 22,242, every one containing `�` |
+| `--threads 1` | none missing; 2,351 extra in 1.2.0 | 22,242, every one containing `�` |
+| `--threads 8` | none missing; 2,332 extra in 1.2.0 | 21,981, every one containing `�` |
+
+The extra ASCII candidates are the next lines of the stream. 1.2.0 emits about
+2,350 fewer junk lines in its first billion, so it reaches slightly further. In
+1.2.0's stream, 1,228 of the billion lines are not valid UTF-8, and 70 still
+contain `�`; the latter come from vocabulary tokens that really are that
+character.
+
+| depth | rockyou 1.1.0 → 1.2.0 | enterprise_union 1.1.0 → 1.2.0 |
+|---:|---:|---:|
+| 1e7 | 26,898 → 26,898 | 1,954 → 1,954 |
+| 1e8 | 54,787 → 54,787 | 5,956 → 5,956 |
+| 1e9 | 72,619 → **72,621** | 11,404 → 11,404 |
+
+(`--strict` and `--threads 1`; `--threads 8` gains the same 2 at 1e9.) The two
+new cracks are `ESPAÑOL` and `Maturìn`. 1.1.0 could not produce them because it
+rendered `Ñ` / `ì` as `�`. Resume was tested separately: a SIGKILLed fast-mode
+run resumes without truncation and reproduces the uninterrupted candidate set;
+strict resume is byte-identical; a 1.1.0 checkpoint is refused.
 
 ## 1.1.0 — 2026-09-02
 
