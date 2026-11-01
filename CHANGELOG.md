@@ -5,7 +5,7 @@ All notable changes to tokenov are recorded here. Versions follow
 or model format, MINOR for new opt-in surface with unchanged default output,
 PATCH for fixes.
 
-## 1.2.0 — unreleased
+## 1.2.0 — 2026-11-01
 
 Fixes non-ASCII candidates and three `--wordlist` defects. **Default output
 changes, but only on lines that were already broken.** These are candidates
