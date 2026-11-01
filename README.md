@@ -103,7 +103,7 @@ tokenov model train \
 Inspect a model's embedded provenance:
 
 ```bash
-tokenov model info model.ngram      # tokenizer, train corpus, build time, version
+tokenov model info model.ngram      # tokenizer, train corpus, build time, version, decode-table status
 ```
 
 Every `model train` registers the model in `~/.config/tokenov/models.toml`, so
@@ -212,6 +212,35 @@ seed keeps its place as the prefix and affixes are **appended** (`cisco` →
 - `--float` — rarity-weighted graft with affixes on **either** side (the pre-0.20
   default).
 
+These are **two different generators**, not three settings of one. The default
+and `--append-only` run the normal enumerator, rooted at your seeds, so every
+`generate` flag works with them. `--prepend-only` and `--float` run a separate
+**graft generator**:
+
+- **It ranks seeds by rarity.** Each seed's surprisal under the model sets its
+  share of `--count`, so the rarest, most target-specific seeds get the most
+  candidates. A pool of the model's likeliest affixes is then joined onto each
+  one.
+- **It splits compound seeds.** A seed the tokenizer splits into pieces that are
+  all ≥ 3 characters is treated as compound, and each piece of ≥ 4 characters
+  also becomes an anchor. `johnsmith` gives `john` and `smith`; `northwind` gives
+  `north` and `wind`. An atomic word that BPE splits mid-word always leaves a
+  short piece (`cisco` is `c`+`isco`), so it stays whole.
+- **It is finite.** The affix pool is fixed, so a short wordlist can run out
+  before `--count`. `--count` is a ceiling, not a promise.
+- **It shapes output like the enumerator.** `--enterprise` and `--case-shape`
+  apply, as do `--min-len` / `--max-len`. If `--enterprise` leaves fewer
+  candidates than `--count`, it warns rather than finishing short silently.
+- **Some flags have nothing to act on.** Graft is single-threaded, has no level
+  sweep, and writes no checkpoint. `--strict`, `--threads`, `--max-tokens`,
+  `--unigram-tail`, `--resume`, `--resume-state` and `--checkpoint-file`
+  therefore **print a warning and are ignored** with `--prepend-only` / `--float`.
+  Output is the same as without them. `--min-level` is an **error** there, since
+  it would otherwise change which candidates you get. To use any of these, drop
+  `--prepend-only` / `--float` and run the default (append) path.
+- **It does not combine with the legacy `--mode`.** That selects a third code
+  path, so `--mode` together with `--prepend-only` / `--float` is an error.
+
 ```bash
 # OSINT-style: target a community using its known terms (append-only default)
 tokenov generate \
@@ -245,9 +274,16 @@ export TOKENOV_TOKENIZER=/path/to/tokenizer.json
 
 #### Output format
 
-Candidates write to `--output PATH` as **plain UTF-8 text, one
-candidate per line**. Tokenov does not compress its output. If you
-want compression at rest, run a post-step:
+Candidates write to `--output PATH` as **plain text, one candidate per
+line**. Each candidate is the exact bytes of its tokens. With a byte-level
+tokenizer (the default), a non-ASCII character can span two tokens. A candidate
+is usually valid UTF-8, but smoothing can join a token that starts a multi-byte
+character to one that does not finish it. hashcat and other crackers take the
+bytes as they are. A script that reads the output should open it in binary mode
+(e.g. Python `open(path, 'rb')`) rather than assume UTF-8.
+
+Tokenov does not compress its output. If you want compression at rest, run a
+post-step:
 
 ```bash
 tokenov generate --model m.ngram --count 1000000000 --output cands.txt
@@ -396,9 +432,10 @@ weight.
 by only a few hundred candidates, so a sweep calibrated there will read as
 inert. Calibrate at 1e9.
 
-**Limitations.** The flag has no effect on the graft generator
-(`--wordlist` with `--prepend-only` or `--float`), which ranks seeds by
-surprisal rather than sweeping the model's tiers. `score` and `calibrate` always
+**Limitations.** The graft generator (`--wordlist` with `--prepend-only` or
+`--float`) warns and ignores the flag. That generator ranks seeds by surprisal
+rather than sweeping the model's tiers, so the tail has nothing to act on.
+`score` and `calibrate` always
 use the default weight, so scores are not directly comparable to a stream
 generated with a non-default `FRACTION`.
 
@@ -725,8 +762,8 @@ use `--json` to get the machine telemetry stream on stderr without `-v`.
 | `--enterprise` | emit only policy-compliant candidates (≥8 chars + ≥3 of 5 classes; capitalize-first repair) | (off) |
 | `--wordlist <PATH>` | OSINT/target wordlist (one entry per line) | (none → standard mode) |
 | `--append-only` | append affixes to the seed (seed stays prefix) | **default** for `--wordlist` |
-| `--prepend-only` | prepend affixes (seed becomes suffix) | (off) |
-| `--float` | affixes on either side (rarity-weighted graft; pre-0.20 default) | (off) |
+| `--prepend-only` | prepend affixes (seed becomes suffix); runs the graft generator, which ignores (with a warning) `--strict` / `--threads` / `--max-tokens` / `--unigram-tail` / resume and checkpoint flags, and rejects `--min-level` | (off) |
+| `--float` | affixes on either side (rarity-weighted graft; pre-0.20 default); same generator and restrictions as `--prepend-only` | (off) |
 | `--mode <weighted\|seeded\|combined>` | legacy wordlist-targeting strategy (hidden) | (unset) |
 | `--bias <FLOAT>` | legacy: strength multiplier for W-tokens (weighted/combined; hidden) | 2.0 |
 | `--seed-mode <entry\|token>` | legacy: per-entry vs per-token seeding (hidden) | `entry` |
@@ -761,10 +798,27 @@ blob**, then the model body.
 
 The provenance blob (a `u32` byte-length prefix, then a little-endian record:
 schema version, the embedded `tokenizer.json` bytes, the `--tokenizer` and
-`--train` paths, the build time, and the tokenov version) makes a v3 model
+`--train` paths, the build time, the tokenov version, and — from schema 2 on — a
+`decode_exact` flag) makes a v3 model
 **self-describing** — `generate --wordlist` and `model info` read the tokenizer
 straight from the file, so it survives a bare single-file copy with no sidecar.
 Inspect it with `tokenov model info <model.ngram>`.
+
+**Decode table and the `decode_exact` flag.** The body stores, for every token,
+the bytes it decodes to.
+
+- **Models built before 1.2.0 have a lossy table.** Older builds decoded each
+  token on its own, so a token holding part of a multi-byte character was stored
+  as U+FFFD (`�`). That is 352 of 50,257 entries in the default model.
+- **1.2.0 stores the raw bytes and sets `decode_exact`.**
+- **An older v3 model is repaired at load.** With no flag, tokenov rebuilds the
+  table in memory from the embedded tokenizer, in about 0.1 s, and prints a
+  one-line note on stderr. The file itself is unchanged. Retrain with
+  `tokenov model train` to store the fixed table and skip the rebuild.
+- **v1/v2 models cannot be repaired.** They embed no tokenizer, so tokenov warns
+  instead.
+- **The flag is additive.** Older tokenov releases ignore it and still load
+  1.2.0 models, and read the corrected table as stored.
 
 The body is the Kneser-Ney model: a header (vocab size, START/END sentinels, KN
 discount D, decode-table length), then per-context records (trigram cumdists,

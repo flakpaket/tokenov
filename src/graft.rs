@@ -9,10 +9,13 @@
 //! emitted rarest-seed-first. No per-candidate scoring — order comes from
 //! rarity-first blocks + a frequency-ordered affix pool.
 //!
-//! This module is the default for `--wordlist` (no --mode) and is fully isolated from the
-//! Markov enumerator (it does not touch the seeds/bias/heap paths), so standard
-//! mode and the legacy `weighted|seeded|combined` modes stay byte-identical.
+//! This module is OPT-IN, via `--float` or `--prepend-only`. Bare `--wordlist`
+//! (and its explicit spelling `--append-only`) runs the Markov enumerator's
+//! seeded path instead, NOT this module. It is fully isolated from the
+//! enumerator (it does not touch the seeds/bias/heap paths), so standard mode
+//! and the legacy `weighted|seeded|combined` modes stay byte-identical.
 
+use crate::case_mask::{apply_op, CaseMask};
 use crate::variant::EnumModel;
 use crate::{Ctx, GenerateArgs, Model};
 use anyhow::Result;
@@ -96,34 +99,38 @@ fn good_affix(decode: &[Vec<u8>], t: u32) -> bool {
     s.chars().all(|c| c.is_ascii_digit()) || s.chars().count() >= 3
 }
 
-/// Anchor chunks for a seed: the whole seed (always) + single-token sub-chunks
-/// that are distinctive (decoded len ≥ K chars AND surprisal ≥ THRESH × the
-/// whole seed's). Single-token is load-bearing: it keeps `cisco`'s `isco` but
-/// rejects the multi-token splices (`ecorp`, `mecorp`) that shatter a messy
-/// unique term like `acmecorp`.
-fn anchor_chunks(
-    em: &EnumModel,
-    uni_cont: &[f32],
-    decode: &[Vec<u8>],
-    start_id: u32,
-    seq: &[u32],
-    k: usize,
-    thresh: f32,
-) -> Vec<Vec<u32>> {
-    let whole_sur = surprisal(em, uni_cont, start_id, seq);
+/// Minimum decoded length (chars) for a sub-chunk to stand on its own as an anchor.
+const MIN_CHUNK_CHARS: usize = 4;
+/// Minimum decoded length (chars) required of EVERY piece of a seed before we
+/// trust the tokenizer's split as a word boundary.
+const MIN_PIECE_CHARS: usize = 3;
+
+/// Anchor chunks for a seed: the whole seed (always), plus single-token
+/// sub-chunks — but only when the tokenizer split the seed at what look like
+/// word boundaries.
+///
+/// A sub-chunk only earns a guess if it is a word in its own right: `johnsmith`
+/// → `john`/`smith` and `northwind` → `north`/`wind` are worth cracking with,
+/// `cisco` → `isco` and `summer` → `sum`/`mer` are not. BPE splits an atomic
+/// word mid-morpheme, and the tell is a SHORT piece — `cisco` is `c`+`isco`,
+/// `summer` is `sum`+`mer`, `acmecorp` is `ac`+`m`+`ec`+`orp`, whereas
+/// `johnsmith` is `john`+`smith`. So require every piece to reach
+/// MIN_PIECE_CHARS before trusting any of them, then keep the pieces that are
+/// themselves >= MIN_CHUNK_CHARS.
+///
+/// Rarity deliberately does NOT gate admission. The rarest pieces are exactly
+/// the mid-morpheme splinters, so the old `surprisal >= 0.6 * whole` test kept
+/// `isco` and threw away `wind`. Surprisal still orders the chunks and sizes
+/// their budgets in `run` — it just no longer decides membership.
+fn anchor_chunks(decode: &[Vec<u8>], seq: &[u32]) -> Vec<Vec<u32>> {
     let mut out: Vec<Vec<u32>> = vec![seq.to_vec()];
-    if seq.len() > 1 {
-        for &t in seq {
-            if decode_ids(decode, &[t]).chars().count() < k {
-                continue;
-            }
-            if surprisal(em, uni_cont, start_id, &[t]) >= thresh * whole_sur {
-                let chunk = vec![t];
-                if !out.contains(&chunk) {
-                    out.push(chunk);
-                }
-            }
-        }
+    if seq.len() < 2 { return out; }
+    let piece_chars = |t: u32| decode_ids(decode, &[t]).chars().count();
+    if !seq.iter().all(|&t| piece_chars(t) >= MIN_PIECE_CHARS) { return out; }
+    for &t in seq {
+        if piece_chars(t) < MIN_CHUNK_CHARS { continue; }
+        let chunk = vec![t];
+        if !out.contains(&chunk) { out.push(chunk); }
     }
     out
 }
@@ -159,16 +166,47 @@ fn build_pools(em: &EnumModel, model: &Model, start_id: u32, n: usize) -> (Vec<u
 }
 
 /// Allocate a total budget across weights proportionally (∝ weight), min 1 each.
+///
+/// Floors each share and then hands the rounding remainder to the largest
+/// fractional parts (largest-remainder apportionment), so the budgets sum to
+/// exactly `total` rather than drifting short — rounding each share
+/// independently left `--count 500` over 200 seeds allocating only 498.
+///
+/// The min-1 floor still makes the sum EXCEED `total` when there are more
+/// weights than budget (200 seeds, `--count 10`). That is what the emitter's
+/// global `--count` stop is for; allocation alone cannot express it.
 fn alloc_budget(weights: &[f32], total: u64) -> Vec<u64> {
+    let n = weights.len();
+    if n == 0 { return Vec::new(); }
     let sum: f64 = weights.iter().map(|w| *w as f64).sum::<f64>().max(1e-9);
-    weights
-        .iter()
-        .map(|w| ((total as f64) * (*w as f64) / sum).round().max(1.0) as u64)
-        .collect()
+    let exact: Vec<f64> = weights.iter().map(|w| (total as f64) * (*w as f64) / sum).collect();
+    let mut out: Vec<u64> = exact.iter().map(|e| e.floor().max(1.0) as u64).collect();
+    let assigned: u64 = out.iter().sum();
+    let mut rem = total.saturating_sub(assigned);
+    if rem == 0 { return out; }
+    // Largest fractional part first; ties keep input order (stable sort).
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let (fa, fb) = (exact[a] - exact[a].floor(), exact[b] - exact[b].floor());
+        fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // One extra each, largest remainder first. `rem < n` after a floor pass
+    // unless min-1 clamping consumed the budget, so spread any surplus evenly.
+    let each = rem / n as u64;
+    if each > 0 {
+        for v in out.iter_mut() { *v += each; }
+        rem -= each * n as u64;
+    }
+    for &i in order.iter().take(rem as usize) {
+        out[i] += 1;
+    }
+    out
 }
 
-/// Streaming candidate writer with decoded-string dedup (first-occurrence) and
-/// a length filter. Owns the Sink so the emission loop stays borrow-clean.
+/// Streaming candidate writer with decoded-string dedup (first-occurrence), a
+/// length filter, the `--count` ceiling, and the two post-decode shapers
+/// (`--case-shape`, `--enterprise`). Owns the Sink so the emission loop stays
+/// borrow-clean.
 struct Emitter<'a> {
     sink: crate::Sink,
     seen: rustc_hash::FxHashSet<String>,
@@ -176,24 +214,85 @@ struct Emitter<'a> {
     min_len: usize,
     max_len: usize,
     min_tokens: usize,
+    /// `--count` ceiling. `u64::MAX` when the flag is omitted (emit everything).
+    /// Enforced HERE as well as in the loops: the per-seed/per-chunk budgets are
+    /// proportional allocations with a min of 1 each, so on a wordlist with more
+    /// entries than `--count` they sum well past it. This is the hard stop.
+    cap: u64,
+    /// `--case-shape` patterns. Empty = one plain emission per candidate.
+    masks: &'a [CaseMask],
+    /// `--enterprise`: policy gate + capitalize-first repair.
+    enterprise: bool,
     emitted: u64,
     dupes: u64,
 }
 
 impl<'a> Emitter<'a> {
-    /// Decode, length-check, dedup, write. Returns Ok(true) if a NEW line was
-    /// written, Ok(false) if filtered/duplicate (so the caller doesn't count it
-    /// against the budget — budget is a target of distinct emitted lines).
+    #[inline]
+    fn full(&self) -> bool { self.emitted >= self.cap }
+
+    /// Decode, shape, length-check, dedup, write. Returns Ok(true) if at least
+    /// one NEW line was written, Ok(false) if filtered/duplicate/at-cap (so the
+    /// caller doesn't count it against the budget — budget is a target of
+    /// distinct emitted lines).
     fn emit(&mut self, cand: &[u32]) -> Result<bool> {
+        if self.full() { return Ok(false); }
         // Token-count floor (--min-tokens): drop grafts built from too few tokens.
         if cand.len() < self.min_tokens {
             return Ok(false);
         }
-        let s = decode_ids(self.decode, cand);
+        if self.masks.is_empty() {
+            let s = decode_ids(self.decode, cand);
+            return self.emit_one(s);
+        }
+        // Shape-conditioned path: one emission per case mask, each slot's op
+        // applied to its own token's bytes (the token is the unit of casing) —
+        // same contract as the enumerator's --case-shape path.
+        let masks = self.masks;
+        let mut wrote = false;
+        for mask in masks {
+            if self.full() { break; }
+            let s = self.render(cand, mask);
+            if self.emit_one(s)? { wrote = true; }
+        }
+        Ok(wrote)
+    }
+
+    /// Decode `cand` applying `mask`'s per-token case op.
+    fn render(&self, cand: &[u32], mask: &CaseMask) -> String {
+        let mut b = Vec::new();
+        for (pos, &id) in cand.iter().enumerate() {
+            if let Some(bytes) = self.decode.get(id as usize) {
+                let start = b.len();
+                b.extend_from_slice(bytes);
+                let end = b.len();
+                apply_op(&mut b[start..end], mask.op_for(pos));
+            }
+        }
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    fn emit_one(&mut self, s: String) -> Result<bool> {
         let len = s.chars().count();
         if len < self.min_len || len > self.max_len {
             return Ok(false);
         }
+        // --enterprise: emit only policy-compliant candidates, capitalizing the
+        // first byte when that is the sole missing class. Dropped candidates do
+        // NOT count toward `emitted`, matching the enumerator's L0 path.
+        let s = if self.enterprise {
+            match crate::enterprise::decide(s.as_bytes()) {
+                crate::enterprise::Decision::AsIs => s,
+                crate::enterprise::Decision::Cap => {
+                    let mut b = s.into_bytes();
+                    b[0] = b[0].to_ascii_uppercase();
+                    String::from_utf8_lossy(&b).into_owned()
+                }
+                crate::enterprise::Decision::Drop => return Ok(false),
+            }
+        } else {
+            s
+        };
         if self.seen.contains(&s) {
             self.dupes += 1;
             return Ok(false);
@@ -205,21 +304,21 @@ impl<'a> Emitter<'a> {
     }
 }
 
-/// Entry point for the default --wordlist graft generator. Emits rarity-weighted combinations:
-/// rarest seed first; per-seed and per-chunk budget ∝ surprisal; each anchor
-/// combined with the affix pool (+ other seeds' distinctive chunks for mixing).
-pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec<u32>]) -> Result<()> {
+/// Entry point for the graft generator (`--float` / `--prepend-only`, NOT the
+/// `--wordlist` default). Emits rarity-weighted combinations: rarest seed first;
+/// per-seed and per-chunk budget ∝ surprisal; each anchor combined with the
+/// affix pool (+ other seeds' distinctive chunks for mixing).
+pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec<u32>],
+           case_masks: &[CaseMask]) -> Result<()> {
     let start_id = model.start_id;
     let uni = &model.unigram_kn_cont;
     let decode = &model.decode;
-    const K: usize = 2;
-    const THRESH: f32 = 0.6;
     let prepend_only = args.prepend_only;
 
     // Per-seed: surprisal + anchor chunks. Sort rarest-first.
     let mut seeds: Vec<(f32, Vec<Vec<u32>>)> = entry_seqs
         .iter()
-        .map(|s| (surprisal(em, uni, start_id, s), anchor_chunks(em, uni, decode, start_id, s, K, THRESH)))
+        .map(|s| (surprisal(em, uni, start_id, s), anchor_chunks(decode, s)))
         .collect();
     seeds.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -259,11 +358,15 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
         min_len: args.min_len,
         max_len: args.max_len,
         min_tokens: args.min_tokens,
+        cap: args.count.unwrap_or(u64::MAX),
+        masks: case_masks,
+        enterprise: args.enterprise,
         emitted: 0,
         dupes: 0,
     };
 
     for (si, (_, chunks)) in seeds.iter().enumerate() {
+        if em_out.full() { break; }
         let sb = seed_budgets[si];
         // Chunk order + budget: rarest chunk first (whole seed = rarest → leads
         // its block), budget ∝ chunk surprisal (recursive rarity).
@@ -279,7 +382,7 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
 
         let mut seed_emitted: u64 = 0;
         for (rank, &ci) in order.iter().enumerate() {
-            if seed_emitted >= sb { break; }
+            if seed_emitted >= sb || em_out.full() { break; }
             let anchor = &chunks[ci];
             let cb = chunk_budgets[rank].min(sb.saturating_sub(seed_emitted));
             let mut ce: u64 = 0;
@@ -293,7 +396,7 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
             // 2. anchor + suffix
             if !prepend_only {
                 'suf: for s in &suffix_pieces {
-                    if ce >= cb { break; }
+                    if ce >= cb || em_out.full() { break; }
                     buf.clear(); buf.extend_from_slice(anchor); buf.extend_from_slice(s);
                     if em_out.emit(&buf)? { ce += 1; seed_emitted += 1; }
                     if seed_emitted >= sb { break 'suf; }
@@ -301,7 +404,7 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
             }
             // 3. prefix + anchor
             'pre: for p in &prefix_pieces {
-                if ce >= cb { break; }
+                if ce >= cb || em_out.full() { break; }
                 buf.clear(); buf.extend_from_slice(p); buf.extend_from_slice(anchor);
                 if em_out.emit(&buf)? { ce += 1; seed_emitted += 1; }
                 if seed_emitted >= sb { break 'pre; }
@@ -309,9 +412,9 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
             // 4. prefix + anchor + suffix
             if !prepend_only {
                 'both: for p in &prefix_pieces {
-                    if ce >= cb { break; }
+                    if ce >= cb || em_out.full() { break; }
                     for s in &suffix_pieces {
-                        if ce >= cb { break; }
+                        if ce >= cb || em_out.full() { break; }
                         buf.clear();
                         buf.extend_from_slice(p); buf.extend_from_slice(anchor); buf.extend_from_slice(s);
                         if em_out.emit(&buf)? { ce += 1; seed_emitted += 1; }
@@ -327,5 +430,120 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
         "[graft] emitted {} candidates ({} duplicates skipped)",
         em_out.emitted, em_out.dupes
     ));
+    // --enterprise drops everything that cannot reach 3 character classes, and
+    // the graft affix pools are finite — so a policy run can legitimately come
+    // up short, or empty. Say so: silently emitting nothing looks like a crash.
+    // (The enumerator has no such ceiling; it just enumerates deeper.) Fires
+    // with or without --count, since `--float --enterprise` and no budget
+    // emitting nothing is the very case this exists to explain.
+    let policy_shortfall = match args.count {
+        Some(target) => em_out.emitted < target,
+        None        => em_out.emitted == 0,
+    };
+    if args.enterprise && policy_shortfall {
+        let wanted = match args.count {
+            Some(t) => format!(" of the {t} requested"),
+            None    => String::new(),
+        };
+        let why = if prepend_only {
+            "--prepend-only only adds a PREFIX, so most candidates never reach 3 of \
+             {lower, upper, digit, special}. "
+        } else { "" };
+        crate::warn_msg(&format!(
+            "warning: --enterprise kept only {}{} candidates — the graft affix pools \
+             ran out of policy-compliant combinations. {}Use the default --wordlist \
+             enumerator (drop {}) to keep enumerating deeper until the budget is met, \
+             or widen the pools with more seeds.",
+            em_out.emitted, wanted, why,
+            if prepend_only { "--prepend-only" } else { "--float" }));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a decode table + token sequence from the pieces a tokenizer would
+    /// produce, so the admission rule can be tested on real BPE splits. Equal
+    /// pieces share one id, as in a real vocabulary.
+    fn seed(pieces: &[&str]) -> (Vec<Vec<u8>>, Vec<u32>) {
+        let mut decode: Vec<Vec<u8>> = Vec::new();
+        let mut seq: Vec<u32> = Vec::new();
+        for p in pieces {
+            let b = p.as_bytes().to_vec();
+            let id = decode.iter().position(|d| *d == b).unwrap_or_else(|| {
+                decode.push(b);
+                decode.len() - 1
+            });
+            seq.push(id as u32);
+        }
+        (decode, seq)
+    }
+
+    fn chunks_of(pieces: &[&str]) -> Vec<String> {
+        let (decode, seq) = seed(pieces);
+        anchor_chunks(&decode, &seq).iter().map(|c| decode_ids(&decode, c)).collect()
+    }
+
+    // A seed BPE split mid-morpheme leaves a short piece; none of its pieces
+    // may become an anchor. These are the real tokenov_v1 splits.
+    #[test]
+    fn atomic_words_yield_no_sub_chunks() {
+        assert_eq!(chunks_of(&["c", "isco"]), vec!["cisco"]);           // `isco` is junk
+        assert_eq!(chunks_of(&["sum", "mer"]), vec!["summer"]);         // 3-char pieces
+        assert_eq!(chunks_of(&["ac", "m", "ec", "orp"]), vec!["acmecorp"]);
+        assert_eq!(chunks_of(&["tes", "la"]), vec!["tesla"]);
+    }
+
+    // A compound split at word boundaries contributes each word-sized piece.
+    #[test]
+    fn compound_words_yield_word_sub_chunks() {
+        assert_eq!(chunks_of(&["john", "smith"]), vec!["johnsmith", "john", "smith"]);
+        assert_eq!(chunks_of(&["north", "wind"]), vec!["northwind", "north", "wind"]);
+    }
+
+    #[test]
+    fn single_token_seed_yields_only_itself() {
+        assert_eq!(chunks_of(&["microsoft"]), vec!["microsoft"]);
+    }
+
+    // The whole seed always leads, so it keeps the budget its rarity earned.
+    #[test]
+    fn whole_seed_is_always_first() {
+        for pieces in [vec!["john", "smith"], vec!["c", "isco"], vec!["microsoft"]] {
+            assert_eq!(chunks_of(&pieces)[0], pieces.concat());
+        }
+    }
+
+    // A repeated piece must not produce a duplicate anchor.
+    #[test]
+    fn repeated_piece_is_deduped() {
+        assert_eq!(chunks_of(&["bank", "bank"]), vec!["bankbank", "bank"]);
+    }
+
+    #[test]
+    fn alloc_budget_is_proportional_and_never_zero() {
+        let b = alloc_budget(&[3.0, 1.0], 100);
+        assert_eq!(b, vec![75, 25]);
+        // Min 1 each: this is why `--count` needs a separate global stop (the
+        // sum here is 4, not 2).
+        let b = alloc_budget(&[1.0, 1.0, 1.0, 1.0], 2);
+        assert_eq!(b, vec![1, 1, 1, 1]);
+        assert!(alloc_budget(&[0.0, 0.0], 10).iter().all(|&x| x >= 1));
+    }
+
+    // The case that made `--count 500` emit 498: equal shares that each round
+    // down. Largest-remainder must put the budget back.
+    #[test]
+    fn alloc_budget_sums_to_total_exactly() {
+        for (n, total) in [(200usize, 500u64), (3, 10), (7, 1000), (1, 1), (13, 13)] {
+            let w = vec![1.0f32; n];
+            let got: u64 = alloc_budget(&w, total).iter().sum();
+            assert_eq!(got, total, "n={n} total={total}");
+        }
+        // Uneven weights still sum exactly.
+        let got: u64 = alloc_budget(&[5.0, 3.0, 1.1, 0.4], 997).iter().sum();
+        assert_eq!(got, 997);
+    }
 }

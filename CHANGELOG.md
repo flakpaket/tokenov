@@ -5,6 +5,95 @@ All notable changes to tokenov are recorded here. Versions follow
 or model format, MINOR for new opt-in surface with unchanged default output,
 PATCH for fixes.
 
+## 1.2.0 — 2026-11-01
+
+Fixes non-ASCII candidates and three `--wordlist` defects. **Default output
+changes, but only on lines that were already broken.** These are candidates
+containing a token that 1.1.0 rendered as U+FFFD (`�`); every pure-ASCII
+candidate is unchanged (see "Release gate").
+
+### Fixed
+
+- **Non-ASCII candidates are byte-exact.** The model's decode table was built
+  one token at a time. A byte-level BPE token holding part of a multi-byte
+  character is not valid UTF-8 on its own, so it was stored as U+FFFD. That is
+  352 of 50,257 entries in the default model. As a result:
+  - `--float` / `--prepend-only` emitted `�` in place of the seed's real
+    characters, e.g. `ûtԱCXvvIJYZYT` came back as `ût��CXvvIJYZYT`.
+  - Standard mode emitted junk such as `��`.
+
+  The table now stores each token's raw bytes. Existing models do not need
+  retraining: a model built before 1.2.0 is repaired in memory at load from its
+  embedded tokenizer, and tokenov prints a one-line note. `model info` reports
+  which kind of table a model has. Models remain `NGRMv003`; the provenance
+  blob gains an additive `decode_exact` flag (schema 2). Older releases ignore
+  the flag, still load 1.2.0 models, and read the corrected table as stored.
+- **`--count` is a ceiling under `--float` / `--prepend-only`.** Each seed and
+  sub-chunk was given at least one candidate and nothing checked the total, so
+  a 200-entry wordlist with `-c 10` emitted 200. Budgets are now apportioned
+  exactly and the total is enforced.
+- **Graft seed splitting keeps words, not fragments.** Sub-chunks were admitted
+  for being rare. The rarest pieces are mid-word BPE splits, so `cisco` gave
+  `isco` and `summer` gave `sum` / `mer`, while `northwind` lost `wind`. A seed
+  is now split only when every piece is at least 3 characters, and pieces of 4+
+  characters become anchors (`johnsmith` → `john`, `smith`).
+- **`--enterprise` and `--case-shape` work under `--float` / `--prepend-only`.**
+  They were accepted and ignored.
+
+### Changed
+
+- **Graft says which flags it ignores.** `--strict`, `--threads`,
+  `--max-tokens`, `--unigram-tail`, `--resume`, `--resume-state` and
+  `--checkpoint-file` have never had any effect with `--float` /
+  `--prepend-only`, and were accepted silently. They now print a warning naming
+  the ignored flags. Output is byte-identical to running without them, so
+  existing scripts keep working. `--min-level` remains an error there, as in
+  1.1.0.
+- **`--mode` with `--float` / `--prepend-only` is an error.** It previously
+  discarded `--float` / `--prepend-only` without saying so and ran a different
+  generator.
+- **Output is no longer guaranteed valid UTF-8.** Candidates are the tokens'
+  exact bytes. 1.1.0's output was always valid UTF-8 because every partial
+  character had been replaced with `�`. Read output as bytes.
+
+### Documentation
+
+- README explains that the default / `--append-only` path and `--float` /
+  `--prepend-only` are two different generators, and what each supports.
+- README documents the decode-table repair and the `decode_exact` flag.
+
+### Release gate
+
+1.1.0 versus this release, six 1e9 streams on default arguments, cracked against
+rockyou (99,998 hashes) and enterprise_union (83,867) at 1e7/1e8/1e9.
+
+Default output was expected to change, so the test is that it changes **only**
+where the decode fix says it should:
+
+| configuration | pure-ASCII candidates | lines only in 1.1.0 |
+|---|---|---|
+| `--strict` | 1.1.0's are an exact, in-order prefix of 1.2.0's | 22,242, every one containing `�` |
+| `--threads 1` | none missing; 2,351 extra in 1.2.0 | 22,242, every one containing `�` |
+| `--threads 8` | none missing; 2,332 extra in 1.2.0 | 21,981, every one containing `�` |
+
+The extra ASCII candidates are the next lines of the stream. 1.2.0 emits about
+2,350 fewer junk lines in its first billion, so it reaches slightly further. In
+1.2.0's stream, 1,228 of the billion lines are not valid UTF-8, and 70 still
+contain `�`; the latter come from vocabulary tokens that really are that
+character.
+
+| depth | rockyou 1.1.0 → 1.2.0 | enterprise_union 1.1.0 → 1.2.0 |
+|---:|---:|---:|
+| 1e7 | 26,898 → 26,898 | 1,954 → 1,954 |
+| 1e8 | 54,787 → 54,787 | 5,956 → 5,956 |
+| 1e9 | 72,619 → **72,621** | 11,404 → 11,404 |
+
+(`--strict` and `--threads 1`; `--threads 8` gains the same 2 at 1e9.) The two
+new cracks are `ESPAÑOL` and `Maturìn`. 1.1.0 could not produce them because it
+rendered `Ñ` / `ì` as `�`. Resume was tested separately: a SIGKILLed fast-mode
+run resumes without truncation and reproduces the uninterrupted candidate set;
+strict resume is byte-identical; a 1.1.0 checkpoint is refused.
+
 ## 1.1.0 — 2026-09-02
 
 Two new generation controls and four fixes. **Default output is unchanged from
