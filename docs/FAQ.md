@@ -39,23 +39,9 @@ bytes, because `ñ` takes two bytes rather than one. So:
 If you are generating against a non-English target and your length bounds need
 to be exact, allow a byte or two of slack, or filter the output afterwards.
 
-### One exception: the word-list graft generator
-
-Combining `--wordlist` with `--prepend-only` or `--float` selects a separate
-generator, and that one currently measures **characters**, not bytes. On that
-path the two bullets above are reversed: `--max-len 11` accepts `contraseña1`,
-because it counts eleven characters and never looks at the byte total.
-
-Everything else counts bytes as described, including plain `--wordlist` and
-`--wordlist --append-only`, which both run through the standard generator.
-
-This is a known inconsistency rather than a deliberate difference, and it is
-being corrected. Two related limitations apply to the same `--prepend-only` /
-`--float` path in the current release: `--enterprise` is accepted but has no
-effect there, and raising the enterprise minimum length can return noticeably
-fewer candidates than `--count` asked for without warning. Until those are
-fixed, use `--append-only` (the default for `--wordlist`) if you need length
-bounds and policy filtering to behave consistently.
+This applies to standard mode, the default `--wordlist` generator and
+`--rare-first`. The exception is `--float` / `--prepend-only`: that generator
+counts characters, so there `--max-len 11` accepts `Contraseña1`.
 
 ### Why enterprise mode is different
 

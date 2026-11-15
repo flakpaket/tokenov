@@ -5,6 +5,78 @@ All notable changes to tokenov are recorded here. Versions follow
 or model format, MINOR for new opt-in surface with unchanged default output,
 PATCH for fixes.
 
+## 1.3.0 — 2026-11-15
+
+A second way to target a wordlist, and a fix for `--float` on large lists.
+**Output without `--rare-first` is unchanged from 1.2.0**, except where 1.2.0
+stalled (see "Fixed").
+
+### Added
+
+- **`--rare-first`**, an alternative `--wordlist` generator that gives the most
+  candidates to the rarest words in your list. A word's rarity is how unlikely
+  the model finds it, and each word's share of the output is proportional to its
+  rarity raised to the power `--rarity-weight` (default 1). The model generates
+  characters on either side of each word (`ilovecisco`, `cisco2024!`);
+  `--append-only` or `--prepend-only` keeps them to one side. Compound words
+  also contribute their parts (`johnsmith` → `john`, `smith`; `--no-split`
+  turns this off), and `--mix` lets other words from the list be used as
+  additions. Every `generate` flag works with it, including `--strict`,
+  `--threads` and `--resume`.
+
+  Bare `--wordlist` is still the default and in testing cracked more overall:
+  against real leaked corporate passwords, after rockyou with hashcat's best66
+  rules, it cracked about three times as many as `--rare-first`. `--rare-first`
+  is there for runs where you want more of the budget on target-specific words.
+  See [docs/wordlist.md](docs/wordlist.md).
+- **`tokenov bootstrap --rebuild`** retrains the default model from the cached
+  tokenizer and corpus without downloading anything. Use it to rebuild a model
+  made before 1.2.0. If the model already exists and neither `--rebuild` nor
+  `--force` is given, `bootstrap` now stops before doing any work; 1.2.0 could
+  download the corpus first and then fail.
+- **`tokenizer train --vocab-size` and `model train --max-vocab` accept K/M
+  suffixes**, like `--count`: `--vocab-size 8K` is 8000. Plain numbers work as
+  before.
+
+### Fixed
+
+- **`--float` and `--prepend-only` no longer stall on large wordlists.** With
+  more than about 11,000 words (typical for a scraped website), 1.2.0 had
+  printed nothing after five minutes. For a long word, nearly every combination
+  with the fixed additions was longer than `--max-len`, and each one was built
+  and rejected in turn. Such combinations are now skipped before they are
+  built: 10 million candidates from an 87,000-word list take about 12 seconds.
+  Where 1.2.0 did finish, the output is byte-identical.
+- **Builds on Windows in MSYS2 UCRT64.** Resuming a saved session used a
+  Unix-only call, so the build failed on Windows. On Windows the resumed run now
+  starts as a child process and passes its exit code through. Where memory
+  statistics can't be read, tokenov now says so once instead of on every check,
+  and the memory limit is not enforced. Linux and WSL2 remain the supported
+  platforms; see the README.
+
+### Changed
+
+- **The note for models built before 1.2.0 prints the exact command to rebuild
+  the model**, and so does `model info`. The note's wording is also clearer.
+- `--append-only`, `--prepend-only` and `--float` without `--wordlist` now print
+  a warning that they are ignored. 1.2.0 ignored them silently.
+- When a model name isn't found, the error now points to `tokenov model` for
+  the list of registered models.
+
+### Documentation
+
+- The README is cut down to getting started, key concepts and upgrading. The
+  detail moved to one page per topic under `docs/`, including
+  `docs/retired.md` for deprecated flags and commands.
+- `--help` text is rewritten in plain language. `--enterprise`, `--output` and
+  `bootstrap --name` now describe what they actually do.
+- `docs/unigram-tail.md` is rewritten from new measurements at 1 and 10 billion
+  candidates, with and without rules. It now says when the tail is worth using
+  and shows how to build a small tail-only list: the tail candidates the default
+  stream did not already produce, cracked after it. The earlier figures came
+  from a comparison that did not account for overlap between the two streams,
+  and are replaced.
+
 ## 1.2.0 — 2026-11-01
 
 Fixes non-ASCII candidates and three `--wordlist` defects. **Default output

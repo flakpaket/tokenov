@@ -89,6 +89,43 @@ fn decode_ids(decode: &[Vec<u8>], ids: &[u32]) -> String {
     String::from_utf8_lossy(&b).into_owned()
 }
 
+/// Decoded length in chars of a piece, when its bytes are valid UTF-8 on their
+/// own. Concatenating valid UTF-8 adds char counts exactly, and `--case-shape`
+/// and `--enterprise` only change ASCII bytes, so the length check in
+/// `Emitter::emit_one` can be decided from these sums without building the
+/// string. `None` (bytes that are not valid alone, which may combine with a
+/// neighbour) means "unknown": such a combination is never skipped.
+fn char_len(decode: &[Vec<u8>], ids: &[u32]) -> Option<usize> {
+    let mut b = Vec::new();
+    for &id in ids {
+        if let Some(bytes) = decode.get(id as usize) { b.extend_from_slice(bytes); }
+    }
+    std::str::from_utf8(&b).ok().map(|s| s.chars().count())
+}
+
+/// True when a combination of pieces with these lengths is certain to be
+/// longer than `max_len`, so `Emitter::emit_one` would reject it.
+#[inline]
+fn too_long(parts: &[Option<usize>], max_len: usize) -> bool {
+    let mut sum = 0usize;
+    for p in parts {
+        match p { Some(n) => sum += n, None => return false }
+    }
+    sum > max_len
+}
+
+/// Suffix pieces in pool order, bucketed by the longest combination they fit:
+/// `fits[r]` holds every piece whose length is unknown or at most `r`, for
+/// r = 0..=longest known length. A room past the last bucket fits every piece.
+/// Lets the prefix x suffix pass visit only suffixes that can still be emitted,
+/// in the same order, instead of rejecting the rest one by one.
+fn suffix_fits(lens: &[Option<usize>]) -> Vec<Vec<usize>> {
+    let longest = lens.iter().filter_map(|l| *l).max().unwrap_or(0);
+    (0..=longest)
+        .map(|room| (0..lens.len()).filter(|&i| lens[i].map_or(true, |n| n <= room)).collect())
+        .collect()
+}
+
 /// A token is a usable affix if it decodes to clean ASCII and is either all
 /// digits (classic suffixes 1/12/2024) or ≥3 chars (real words, not BPE
 /// fragments like `j`/`ec`).
@@ -326,23 +363,36 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
     // distinctive anchor chunks (multi-token allowed) for wordlist mixing.
     // NOT raw seed sub-tokens — that reintroduces fragment junk (`loveorp`).
     let (prefix_toks, suffix_toks) = build_pools(em, model, start_id, 250);
+    // First occurrence wins, in seed order. A set beside the Vec keeps this
+    // linear: a scan per chunk was quadratic and took minutes on large lists.
     let mut mixing: Vec<Vec<u32>> = Vec::new();
+    let mut mixing_seen: rustc_hash::FxHashSet<&[u32]> = rustc_hash::FxHashSet::default();
     for (_, chunks) in &seeds {
         for c in chunks {
-            if !mixing.contains(c) {
+            if mixing_seen.insert(c.as_slice()) {
                 mixing.push(c.clone());
             }
         }
     }
+    drop(mixing_seen);
     let prefix_pieces: Vec<Vec<u32>> =
         prefix_toks.iter().map(|&t| vec![t]).chain(mixing.iter().cloned()).collect();
     let suffix_pieces: Vec<Vec<u32>> =
         suffix_toks.iter().map(|&t| vec![t]).chain(mixing.iter().cloned()).collect();
 
     crate::log_msg(&format!(
-        "[graft] {} seeds, {} prefix + {} suffix affix pieces, prepend_only={}",
+        "[wordlist] {} words, {} possible prefixes + {} possible suffixes, prepend_only={}",
         seeds.len(), prefix_pieces.len(), suffix_pieces.len(), prepend_only
     ));
+
+    // Piece lengths for skipping combinations over --max-len. Without this, a
+    // long seed made the prefix x suffix pass reject every one of its ~10^8
+    // combinations in turn, and a large wordlist stalled with no output.
+    let max_len = args.max_len;
+    let prefix_lens: Vec<Option<usize>> = prefix_pieces.iter().map(|p| char_len(decode, p)).collect();
+    let suffix_lens: Vec<Option<usize>> = suffix_pieces.iter().map(|p| char_len(decode, p)).collect();
+    let suffix_fit = suffix_fits(&suffix_lens);
+    let all_suffixes: Vec<usize> = (0..suffix_pieces.len()).collect();
 
     // Seed budgets ∝ surprisal (∞ / emit-all when --count omitted).
     let weights: Vec<f32> = seeds.iter().map(|(s, _)| *s).collect();
@@ -384,39 +434,53 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
         for (rank, &ci) in order.iter().enumerate() {
             if seed_emitted >= sb || em_out.full() { break; }
             let anchor = &chunks[ci];
+            let anchor_len = char_len(decode, anchor);
             let cb = chunk_budgets[rank].min(sb.saturating_sub(seed_emitted));
             let mut ce: u64 = 0;
 
             // Emission order within a chunk (affixes iterated in pool = frequency
             // order): bare anchor → append → prepend → both. prepend_only skips
-            // the append/both passes.
+            // the append/both passes. Combinations certain to exceed --max-len
+            // are skipped before they are built; emit would reject them anyway,
+            // so the output is unchanged.
             let mut buf: Vec<u32> = Vec::with_capacity(16);
             // 1. bare anchor
             if ce < cb && em_out.emit(anchor)? { ce += 1; seed_emitted += 1; }
             // 2. anchor + suffix
             if !prepend_only {
-                'suf: for s in &suffix_pieces {
+                'suf: for (si, s) in suffix_pieces.iter().enumerate() {
                     if ce >= cb || em_out.full() { break; }
+                    if too_long(&[anchor_len, suffix_lens[si]], max_len) { continue; }
                     buf.clear(); buf.extend_from_slice(anchor); buf.extend_from_slice(s);
                     if em_out.emit(&buf)? { ce += 1; seed_emitted += 1; }
                     if seed_emitted >= sb { break 'suf; }
                 }
             }
             // 3. prefix + anchor
-            'pre: for p in &prefix_pieces {
+            'pre: for (pi, p) in prefix_pieces.iter().enumerate() {
                 if ce >= cb || em_out.full() { break; }
+                if too_long(&[prefix_lens[pi], anchor_len], max_len) { continue; }
                 buf.clear(); buf.extend_from_slice(p); buf.extend_from_slice(anchor);
                 if em_out.emit(&buf)? { ce += 1; seed_emitted += 1; }
                 if seed_emitted >= sb { break 'pre; }
             }
             // 4. prefix + anchor + suffix
             if !prepend_only {
-                'both: for p in &prefix_pieces {
+                'both: for (pi, p) in prefix_pieces.iter().enumerate() {
                     if ce >= cb || em_out.full() { break; }
-                    for s in &suffix_pieces {
+                    // Suffixes that can still fit after this prefix and anchor.
+                    let fits: &[usize] = match (prefix_lens[pi], anchor_len) {
+                        (Some(a), Some(b)) => match max_len.checked_sub(a + b) {
+                            None => continue,
+                            Some(room) => suffix_fit.get(room).map_or(&all_suffixes[..], |v| &v[..]),
+                        },
+                        _ => &all_suffixes[..],
+                    };
+                    for &si in fits {
                         if ce >= cb || em_out.full() { break; }
                         buf.clear();
-                        buf.extend_from_slice(p); buf.extend_from_slice(anchor); buf.extend_from_slice(s);
+                        buf.extend_from_slice(p); buf.extend_from_slice(anchor);
+                        buf.extend_from_slice(&suffix_pieces[si]);
                         if em_out.emit(&buf)? { ce += 1; seed_emitted += 1; }
                         if seed_emitted >= sb { break 'both; }
                     }
@@ -427,7 +491,7 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
 
     em_out.sink.finish()?;
     crate::log_msg(&format!(
-        "[graft] emitted {} candidates ({} duplicates skipped)",
+        "[wordlist] emitted {} candidates ({} duplicates skipped)",
         em_out.emitted, em_out.dupes
     ));
     // --enterprise drops everything that cannot reach 3 character classes, and
@@ -450,11 +514,12 @@ pub fn run(args: &GenerateArgs, em: &EnumModel, model: &Model, entry_seqs: &[Vec
              {lower, upper, digit, special}. "
         } else { "" };
         crate::warn_msg(&format!(
-            "warning: --enterprise kept only {}{} candidates — the graft affix pools \
-             ran out of policy-compliant combinations. {}Use the default --wordlist \
-             enumerator (drop {}) to keep enumerating deeper until the budget is met, \
-             or widen the pools with more seeds.",
-            em_out.emitted, wanted, why,
+            "warning: --enterprise kept only {}{} candidates — {} joins each word to a \
+             fixed set of additions, and it ran out of combinations that meet the \
+             policy. {}Drop {} to use the default --wordlist generator, which keeps \
+             adding characters until --count is met, or add more words.",
+            em_out.emitted, wanted,
+            if prepend_only { "--prepend-only" } else { "--float" }, why,
             if prepend_only { "--prepend-only" } else { "--float" }));
     }
     Ok(())
@@ -520,6 +585,29 @@ mod tests {
     #[test]
     fn repeated_piece_is_deduped() {
         assert_eq!(chunks_of(&["bank", "bank"]), vec!["bankbank", "bank"]);
+    }
+
+    #[test]
+    fn length_skip_only_when_certain() {
+        let decode = vec![b"abc".to_vec(), vec![0xC3], vec![0xA9], "é".as_bytes().to_vec()];
+        assert_eq!(char_len(&decode, &[0]), Some(3));
+        assert_eq!(char_len(&decode, &[3]), Some(1));
+        assert_eq!(char_len(&decode, &[1]), None);       // half a character
+        assert_eq!(char_len(&decode, &[1, 2]), Some(1)); // whole again
+        assert!(too_long(&[Some(20), Some(11)], 30));
+        assert!(!too_long(&[Some(20), Some(10)], 30));
+        assert!(!too_long(&[Some(40), None], 30));       // unknown: never skipped
+    }
+
+    #[test]
+    fn suffix_fits_keeps_pool_order() {
+        let lens = [Some(3), Some(1), None, Some(2), Some(1)];
+        let f = suffix_fits(&lens);
+        assert_eq!(f.len(), 4);
+        assert_eq!(f[0], vec![2]);
+        assert_eq!(f[1], vec![1, 2, 4]);
+        assert_eq!(f[2], vec![1, 2, 3, 4]);
+        assert_eq!(f[3], vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

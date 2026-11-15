@@ -192,6 +192,7 @@ fn monitor_loop<R: MemReader>(
     min_threads:   usize,
 ) {
     let mut warned_swap    = false;
+    let mut warned_read    = false; // say once, not every tick (e.g. no /proc on Windows)
     let mut soft_cooldown  = 0u32; // ticks remaining before next soft-retirement
 
     loop {
@@ -203,7 +204,11 @@ fn monitor_loop<R: MemReader>(
         let snap = match reader.snapshot() {
             Ok(s)  => s,
             Err(e) => {
-                eprintln!("[mem_monitor] cannot read memory stats: {e}");
+                if !warned_read {
+                    eprintln!("[mem_monitor] cannot read memory stats ({e}); \
+                               the memory limit is not enforced for this run");
+                    warned_read = true;
+                }
                 continue;
             }
         };

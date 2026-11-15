@@ -44,6 +44,7 @@ mod enterprise;
 mod registry;
 mod bootstrap;
 mod graft;
+mod wordlist;
 mod recover;
 
 use case_mask::{apply_op, CaseMask};
@@ -257,17 +258,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Manage models: list (default), train, register, delete.
+    /// Manage models: list (default), train, info, verify, register, delete.
     Model(ModelArgs),
-    /// Manage tokenizers: list/status (default), get, add, delete.
+    /// Manage tokenizers: list (default), get, add, train, set-default, delete.
     Tokenizer(TokenizerArgs),
     /// Emit candidates (default if no subcommand is given).
     Generate(GenerateArgs),
-    /// Score candidate password(s): report each candidate's Rarity (surprisal,
-    /// in bits) and the enumeration level `generate` would emit it in. Reads
-    /// candidates from args, --file, or stdin.
+    /// Score candidate password(s): how guessable each is under the model
+    /// (Rarity, in bits; higher = harder to guess) and the level at which
+    /// `generate` would produce it. Reads candidates from args, --file, or stdin.
     Score(ScoreArgs),
-    /// Quickstart: fetch a tokenizer + RockYou, then train + register a model.
+    /// Quickstart: download RockYou and train the default model with the
+    /// bundled tokenizer.
     Bootstrap(bootstrap::BootstrapArgs),
 
     /// Measure merge throughput and write a chunk-size sidecar. Rarely needed.
@@ -364,8 +366,9 @@ struct TokenizerTrainArgs {
     /// Smaller vocabularies (~1k–8k) often crack password data better than the
     /// 30k+ typical of web-text tokenizers, and the sweet spot grows with the
     /// amount of unique training data — sweep it for your corpus. Must be >= 256
-    /// (the byte-level alphabet alone fills 256 slots).
-    #[arg(long, default_value_t = 8000, value_name = "N")]
+    /// (the byte-level alphabet alone fills 256 slots). Accepts K/M suffixes
+    /// like `--count` (`8K` = 8000).
+    #[arg(long, default_value_t = 8000, value_name = "N", value_parser = parse_count_usize)]
     vocab_size: usize,
 
     /// Minimum pair frequency for a BPE merge to be learned.
@@ -443,13 +446,24 @@ struct BuildArgs {
     name: Option<String>,
 
     /// Cap the model to the first N token IDs of the tokenizer. Default: full
-    /// tokenizer vocab.
-    #[arg(long)]
+    /// tokenizer vocab. Accepts K/M suffixes like `--count` (`30K` = 30000).
+    #[arg(long, value_name = "N", value_parser = parse_count_u32)]
     max_vocab: Option<u32>,
 
     /// Overwrite an existing --output path. Default refuses to clobber.
     #[arg(long)]
     force: bool,
+}
+
+/// `parse_count` for other count-like flags (`--vocab-size`, `--max-vocab`).
+fn parse_count_usize(s: &str) -> Result<usize, String> {
+    let n = parse_count(s)?;
+    usize::try_from(n).map_err(|_| format!("'{s}' is too large"))
+}
+
+fn parse_count_u32(s: &str) -> Result<u32, String> {
+    let n = parse_count(s)?;
+    u32::try_from(n).map_err(|_| format!("'{s}' is too large (max {})", u32::MAX))
 }
 
 /// Parse a candidate count: a plain non-negative integer, or a number with a
@@ -502,51 +516,96 @@ fn parse_count(s: &str) -> Result<u64, String> {
 
 #[derive(clap::Args, Debug, Clone, Default)]
 struct GenerateArgs {
-    /// Path to a target word list, one entry per line. Without this flag the
-    /// tool runs in standard mode using only the supplied or bundled model.
+    /// Path to a target word list, one entry per line. Without this flag
+    /// tokenov runs in standard mode, using only the model. See --append-only,
+    /// --float and --rare-first for the ways a list is used.
     #[arg(long, help_heading = "Generation")]
     wordlist: Option<PathBuf>,
 
     /// Model to generate from: a path to a `.ngram` file, or a registered model
-    /// name (see `tokenov model`). If omitted, uses the built-in default model.
+    /// name (see `tokenov model`). If omitted, uses the default model (built by
+    /// `tokenov bootstrap`).
     #[arg(long, help_heading = "Generation")]
     model: Option<PathBuf>,
 
-    /// Append affixes to the seed (seed stays the prefix, e.g. `cisco2024`).
+    /// Add characters after each word only (`cisco2024`). The default.
     ///
-    /// This is the DEFAULT for --wordlist, and this flag is simply its explicit
-    /// spelling — passing it changes nothing. Each seed becomes a prefix for the
-    /// Markov enumerator, so the full `generate` feature set applies (--strict,
-    /// --threads, --resume, --max-tokens, --min-level, --unigram-tail).
+    /// This is what --wordlist does without other flags, so passing it changes
+    /// nothing. Each word starts the candidate and the model adds characters
+    /// after it; candidates come out likeliest first across all words. Every
+    /// `generate` flag works (--strict, --threads, --resume, --max-tokens,
+    /// --min-level, --unigram-tail). With --rare-first: keeps the added
+    /// characters after the word.
     ///
-    /// Mutually exclusive with --prepend-only / --float.
+    /// Only one of --append-only, --prepend-only and --float can be given.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     append_only: bool,
 
-    /// Prepend affixes instead (seed becomes the suffix, e.g. `lovecisco`).
+    /// Add characters before each word only (`ilovecisco`).
     ///
-    /// Runs the GRAFT generator (see --float), prepend side only.
+    /// Uses the same generator as --float, before the word only. With
+    /// --rare-first: keeps the added characters before the word.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     prepend_only: bool,
 
-    /// Place affixes on EITHER side of the seed (rarity-weighted graft).
+    /// Add characters on either side of each word, rarest words first.
     ///
-    /// The pre-0.20 default. This and --prepend-only select the graft generator,
-    /// a different code path from the default --wordlist enumerator: seeds are
-    /// ranked rarest-first and combined with an affix pool, and a seed the
-    /// tokenizer split at word boundaries also contributes its words on their own
-    /// (`johnsmith` -> `john`, `smith`). It honors --count, --min-len/--max-len,
-    /// --min-tokens, --case-shape and --enterprise, but has no level sweep, no
-    /// worker threads and no checkpoint: --min-level is an error, and --strict /
-    /// --threads / --max-tokens / --unigram-tail / --resume / --resume-state /
-    /// --checkpoint-file warn and are ignored.
-    ///
-    /// Mutually exclusive with --append-only / --prepend-only, and with --mode.
+    /// A separate, simpler generator. Each word's share of --count is
+    /// proportional to how rare the model finds it, and the rarest word comes
+    /// first. The additions come from a fixed set: the most common password
+    /// starts and tokens, plus the other words in your list. Compound words also
+    /// contribute their parts (`johnsmith` -> `john`, `smith`). --count,
+    /// --min-len, --max-len, --min-tokens, --case-shape and --enterprise work.
+    /// It is single-threaded and keeps no checkpoint: --min-level is an error,
+    /// and --strict, --threads, --max-tokens, --unigram-tail, --resume,
+    /// --resume-state and --checkpoint-file print a warning and are ignored.
+    /// With --rare-first: additions on either side, which --rare-first already
+    /// does by default.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     float: bool,
 
+    /// Give the rarest words the most candidates, with model-generated additions.
+    ///
+    /// An alternative to the default --wordlist generator. Each word's share of
+    /// the output is proportional to how rare the model finds it (see
+    /// --rarity-weight). The model adds characters on either side of each word
+    /// (`ilovecisco`, `cisco2024!`, `2024cisco1`); --append-only or
+    /// --prepend-only keeps them to one side. Compound words also contribute
+    /// their parts (`johnsmith` -> `john`, `smith`; see --no-split). Every
+    /// `generate` flag works.
+    ///
+    /// The default usually cracks more overall, because common words followed
+    /// by a number or symbol are still common passwords. --rare-first spends
+    /// more of the budget on the unusual, target-specific words.
+    #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
+    rare_first: bool,
+
+    /// With --rare-first: how strongly rare words dominate. 0 = all words equal.
+    ///
+    /// A word's share of the output is proportional to its rarity raised to
+    /// this power: at 1 (default) a word twice as rare gets twice the
+    /// candidates, at 2 four times. Under --strict the shares hold at every
+    /// point of the output. Without --strict the totals follow the shares, but
+    /// lines arrive in the order the threads produce them. `-v` prints each
+    /// word's share.
+    #[arg(long, default_value_t = 1.0, value_name = "P", help_heading = "Wordlist targeting")]
+    rarity_weight: f32,
+
+    /// With --rare-first: let other words from the list be used as additions
+    /// (`johncisco`, `ciscoacme1`). One per side.
+    ///
+    /// Off by default: the number of pairs grows with the square of the list
+    /// size, so on a large list the pairs would take most of the output.
+    #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
+    mix: bool,
+
+    /// With --rare-first: do not use the parts of compound words (`johnsmith`
+    /// -> `john`, `smith`) as words of their own.
+    #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
+    no_split: bool,
+
     /// LEGACY targeting mode (weighted|seeded|combined). Rarely needed; the
-    /// default append/prepend/float generators supersede it.
+    /// default, --float and --rare-first generators supersede it.
     #[arg(long, value_enum, hide = true)]
     mode: Option<Mode>,
 
@@ -580,25 +639,26 @@ struct GenerateArgs {
     #[arg(short = 'c', long, value_name = "N", value_parser = parse_count, help_heading = "Generation")]
     count: Option<u64>,
 
-    /// Minimum candidate length in bytes (post-decode). 0 disables.
+    /// Minimum candidate length in bytes (characters under --float /
+    /// --prepend-only). 0 disables.
     #[arg(long, default_value_t = 4, value_name = "N", help_heading = "Generation")]
     min_len: usize,
 
-    /// Maximum candidate length in bytes (post-decode). >=256 effectively
-    /// disables.
+    /// Maximum candidate length in bytes (characters under --float /
+    /// --prepend-only). 256 or more effectively disables it.
     #[arg(long, default_value_t = 30, value_name = "N", help_heading = "Generation")]
     max_len: usize,
 
-    /// Maximum number of tokens in any heap-explored path. Heap-level cap.
+    /// Maximum number of tokens per candidate.
     #[arg(long, default_value_t = DEFAULT_MAX_TOKENS, value_name = "N", help_heading = "Generation")]
     max_tokens: usize,
 
     /// Minimum number of tokens per candidate. 1 (default) is a no-op.
     ///
     /// Emit only candidates built from >= N tokens — steers toward multi-token /
-    /// compound structures and away from single-token trivial candidates. A
-    /// drop-at-emit filter (survivors keep their rank order); dropped candidates
-    /// don't count toward --count, so generation enumerates deeper to reach it.
+    /// compound structures and away from single-token trivial candidates.
+    /// Shorter candidates are skipped (the rest keep their order) and don't
+    /// count toward --count, so generation goes deeper to reach it.
     #[arg(long, default_value_t = 1, value_name = "N", help_heading = "Generation")]
     min_tokens: usize,
 
@@ -614,7 +674,8 @@ struct GenerateArgs {
     #[arg(long, default_value_t = 0, value_name = "N", help_heading = "Generation")]
     min_level: u32,
 
-    /// Write candidates (plain UTF-8, one per line) here instead of stdout.
+    /// Write candidates here instead of stdout: plain text, one per line (raw
+    /// bytes; usually but not always valid UTF-8).
     ///
     /// Output is uncompressed; pipe through gzip/zstd/7z to compress at rest.
     #[arg(long, help_heading = "Generation")]
@@ -626,11 +687,11 @@ struct GenerateArgs {
 
     /// Resume the previous run — continues where the last run left off.
     ///
-    /// Resumes from the checkpoint state file (`--checkpoint-file` if given, else
-    /// the rolling default). Both modes restore the saved position in O(depth) and
-    /// continue — no re-enumeration from candidate 0. Fast mode can resume a killed
-    /// `tokenov | hashcat` pipe with NO `--output`; strict mode restores its single
-    /// DFS position and appends to `--output` (so strict resume needs `--output`).
+    /// Resumes from this run's own checkpoint file (or `--checkpoint-file` if
+    /// given). Both modes jump straight back to the saved position — no
+    /// re-generating from candidate 0. Fast mode can resume a killed
+    /// `tokenov | hashcat` pipe with NO `--output`; strict mode appends to
+    /// `--output`, so strict resume needs `--output`.
     /// With `--no-checkpoint` there is no state file, and `--resume` instead re-runs
     /// and skips the first N already-written candidates via the `<output>.progress`
     /// sidecar. Args must match the original run; if nothing is resumable, run
@@ -640,9 +701,7 @@ struct GenerateArgs {
 
     /// List recent generation sessions and exit (newest first).
     ///
-    /// Declared here rather than only on the top-level command so that both
-    /// `tokenov --sessions` and `tokenov generate --sessions` work; the latter
-    /// used to error with "unexpected argument".
+    /// Works as `tokenov --sessions` or `tokenov generate --sessions`.
     #[arg(long, help_heading = "Resume & checkpointing")]
     sessions: bool,
 
@@ -650,11 +709,8 @@ struct GenerateArgs {
     #[arg(long, value_name = "ID", help_heading = "Resume & checkpointing")]
     resume_session: Option<String>,
 
-    /// Merger chunk size (strict mode only): items batched per channel send.
-    ///
-    /// Higher = less overhead; lower = tighter ordering; 1 = per-item. If
-    /// omitted, uses a `.tune.toml` sidecar if present, else auto-tunes.
-    #[arg(long, value_name = "N", help_heading = "Merger tuning")]
+    /// No effect on `generate` (prints a warning). See docs/retired.md.
+    #[arg(long, value_name = "N", hide = true)]
     merge_chunk_size: Option<usize>,
 
     /// Bytes each fast-mode worker buffers before taking the shared output lock.
@@ -667,24 +723,19 @@ struct GenerateArgs {
     #[arg(long, default_value_t = 65536, value_name = "BYTES", hide = true)]
     flush_bytes: usize,
 
-    /// Skip inline auto-tune (strict mode, no sidecar); use the default chunk size.
-    ///
-    /// Uses the default chunk size instead of calibrating first.
-    #[arg(long, default_value_t = false, help_heading = "Merger tuning")]
+    /// No effect on `generate` (prints a warning). See docs/retired.md.
+    #[arg(long, default_value_t = false, hide = true)]
     no_auto_tune: bool,
 
-    /// Force re-calibration even if a `.tune.toml` sidecar exists.
-    ///
-    /// The new measurements overwrite the `<model>.ngram.tune.toml` sidecar.
-    #[arg(long, default_value_t = false, help_heading = "Merger tuning")]
+    /// No effect on `generate` (prints a warning). See docs/retired.md.
+    #[arg(long, default_value_t = false, hide = true)]
     retune: bool,
 
-    /// Telemetry tick interval (ms) for the merger stats thread. 0 disables.
+    /// Telemetry tick interval (ms). 0 disables telemetry.
     ///
     /// Each tick writes one row of (t, total emitted, delta, instantaneous c/s,
     /// avg c/s, total bytes) to the stats CSV (see `--stats-csv`) and one stderr
-    /// line. Cost is two `Relaxed` atomic stores per chunk drain on the merger;
-    /// effectively zero. 0 disables telemetry entirely.
+    /// line. The cost is negligible.
     #[arg(long, default_value_t = 500, value_name = "MS", help_heading = "Telemetry")]
     stats_interval_ms: u64,
 
@@ -719,32 +770,31 @@ struct GenerateArgs {
     /// Strict mode: globally rank-order the candidate stream (best-first).
     ///
     /// Emits one exactly rank-ordered (best-first) stream — the canonical,
-    /// byte-reproducible mode. Always single-threaded: the global merge is serial,
-    /// so more threads give no speedup, and only single-threaded output is
-    /// byte-canonical (--threads > 1 is ignored in strict mode). Slower than fast
+    /// byte-reproducible mode. Always single-threaded: there is one ordered
+    /// output, so more threads would not help (--threads is ignored in strict
+    /// mode). Slower than fast
     /// mode, but the right choice for slow hashes where you only test your top
     /// candidates and ordering beats raw volume. The candidate SET is identical to
     /// fast mode; only the order differs.
     #[arg(long, default_value_t = false, help_heading = "Generation")]
     strict: bool,
 
-    /// Checkpoint the DFS position(s) to a SPECIFIC file.
+    /// Checkpoint the run's position to a SPECIFIC file.
     ///
-    /// Generation checkpoints by DEFAULT to a rolling state file, so every run is
+    /// Every run checkpoints by DEFAULT to its own file, so every run is
     /// resumable with `--resume` and no forethought. Pass this to point the
     /// checkpoint at a named file instead — keep several long tasks going and return
     /// to a specific one by resuming its file. Resume with `--resume` (+ the same
-    /// `--checkpoint-file`) or `--resume-state <file>`; the saved position is
-    /// reconstructed in O(depth) and continues, instead of re-enumerating from
-    /// candidate 0. (Fast mode saves one position per worker; strict mode, being
+    /// `--checkpoint-file`) or `--resume-state <file>`; the run jumps straight
+    /// back to the saved position instead of re-generating from candidate 0. (Fast mode saves one position per worker; strict mode, being
     /// single-threaded, saves one.)
     #[arg(long, value_name = "FILE", help_heading = "Resume & checkpointing")]
     checkpoint_file: Option<PathBuf>,
 
-    /// Disable the default checkpoint state file.
+    /// Disable the default checkpoint file.
     ///
-    /// Generation writes a rolling checkpoint by default so any interrupted run is
-    /// resumable in O(depth). Pass this to skip it entirely (no state file written);
+    /// Every run writes its own checkpoint by default so any interrupted run can
+    /// resume where it stopped. Pass this to skip it entirely (no state file written);
     /// `--resume` then falls back to re-running and skipping the already-written
     /// candidates via the progress sidecar.
     #[arg(long, default_value_t = false, help_heading = "Resume & checkpointing")]
@@ -773,14 +823,12 @@ struct GenerateArgs {
     ///
     /// The tail lets tokenov reach candidates its context statistics alone can't
     /// (`oatmeal77` when `77` never followed `oatmeal` in training). Tail
-    /// entries are weighted below the context tiers so they surface once the
-    /// better options at a level are spent — they are NOT a fallback tier that
-    /// only fires when the others run dry.
+    /// candidates are weighted below the ones the model has seen, so they come
+    /// out once the likelier options at each level are used up.
     ///
-    /// Bare `--unigram-tail` uses the default weight. Pass a FRACTION to change
-    /// how strongly it fires: the fraction of the bigram tier's missing-mass
-    /// budget the tail receives. Higher = tail candidates surface earlier and
-    /// more often; 0.1 is the default.
+    /// Bare `--unigram-tail` uses the default weight, 0.1. Pass a FRACTION to
+    /// change how much probability the tail gets: higher means tail candidates
+    /// appear earlier and more often. See docs/unigram-tail.md.
     #[arg(long, value_name = "FRACTION", num_args = 0..=1,
           default_missing_value = "0.1", help_heading = "Generation")]
     unigram_tail: Option<f32>,
@@ -806,20 +854,21 @@ struct GenerateArgs {
     /// terminal candidate is emitted once per pattern. Named shortcuts: `lower`,
     /// `cap1` (cap first token only), `title` (cap every token), `upper`.
     ///
+    /// Examples:
     ///   --case-shape cap1            -> Spring19
     ///   --case-shape "lower;cap1"    -> springfield AND Springfield
-    ///   --case-shape "?c?l?u"        -> cap tok0, lower tok1, upper tok2+
+    ///   --case-shape "?c?l?u"        -> cap token 1, lower token 2, upper the rest
     ///
-    /// Omit for the default (single lowercase emission; byte-identical to prior
-    /// behavior).
-    #[arg(long = "case-shape", value_name = "SPEC", help_heading = "Case shaping")]
+    /// Omit for normal output (candidates as generated, no re-casing).
+    #[arg(long = "case-shape", value_name = "SPEC", help_heading = "Case shaping",
+          verbatim_doc_comment)]
     case_shape: Option<String>,
 
     /// Enterprise-policy compliance mode: emit only policy-compliant candidates,
     /// applying the minimal repair (capitalize-first) to each one.
     ///
-    /// Policy = byte-length >= 8 AND at least 3 of {lowercase, uppercase, digit,
-    /// special}. Per candidate:
+    /// Policy: at least 8 characters, from at least 3 of 5 classes (lowercase,
+    /// uppercase, digit, special, other letters; see docs/FAQ.md). Per candidate:
     ///   1. already compliant             -> emit as-is
     ///   2. first char [a-z], no capital  -> capitalize it (+0 length), re-check;
     ///                                        emit if now compliant
@@ -834,7 +883,7 @@ struct GenerateArgs {
     /// For POLICY targets only (a set where min-length + complexity are
     /// enforced). Do NOT use on consumer corpora — forcing compliance wrecks
     /// lowercase-dominated sets. Mutually exclusive with --case-shape.
-    #[arg(long, help_heading = "Case shaping",
+    #[arg(long, help_heading = "Case shaping", verbatim_doc_comment,
           conflicts_with_all = ["case_shape"])]
     enterprise: bool,
 
@@ -860,19 +909,19 @@ struct GenerateArgs {
 
     /// FORCE the on-demand (lazy) child path, overriding automatic selection.
     ///
-    /// By DEFAULT tokenov chooses automatically (see the child_cache note below):
-    /// it builds the resident child_cache when its projected size comfortably
-    /// fits available RAM, and falls back to computing Kneser-Ney bigram-backoff
-    /// children on demand when it wouldn't — so you never have to pass a flag to
-    /// avoid an OOM. This flag pins the lazy path unconditionally (e.g. to
+    /// By DEFAULT tokenov chooses automatically: it builds the full cache when
+    /// its projected size comfortably fits available RAM, falls back to a
+    /// bounded cache when it wouldn't, and to computing on demand when even that
+    /// would not pay off — so you never have to pass a flag to avoid running
+    /// out of memory. This flag pins the lazy path unconditionally (e.g. to
     /// minimize RSS regardless of headroom). Output is **byte-identical** either
-    /// way — the child_cache is purely a performance cache. Mutually exclusive
+    /// way — the cache only trades memory for speed. Mutually exclusive
     /// with `--force-child-cache`.
     #[arg(long = "lazy", default_value_t = false,
           conflicts_with = "force_child_cache", help_heading = "Memory safety")]
     lazy_children: bool,
 
-    /// FORCE building the resident child_cache, overriding automatic selection.
+    /// FORCE building the full cache, overriding automatic selection.
     ///
     /// Pins the fast (cached) path even when automatic selection would fall back
     /// to lazy on RAM grounds. Use only when you know the cache fits and want max
@@ -885,8 +934,8 @@ struct GenerateArgs {
     ///
     /// Pins a partial child cache of the N most-recently-used contexts per worker
     /// thread, recomputing on a miss. Bounds RAM (~2·N entries/thread
-    /// resident) while recovering most of the recompute cost via the DFS's
-    /// locality. Output is byte-identical to FULL/LAZY. Mainly a benchmarking /
+    /// resident) while recovering most of the recompute cost, because
+    /// generation revisits recent contexts often. Output is byte-identical to FULL/LAZY. Mainly a benchmarking /
     /// power knob; normally the automatic selector sizes this from the RAM budget.
     /// Mutually exclusive with `--lazy` / `--force-child-cache`.
     #[arg(long, value_name = "N", conflicts_with_all = ["lazy_children", "force_child_cache"],
@@ -1167,6 +1216,83 @@ fn model_read_provenance(path: &Path) -> Result<Option<Provenance>> {
     Ok(Some(Provenance::parse(&blob)?))
 }
 
+/// A v3 model's vocab size, read from the body header without loading the model:
+/// the first body field is `start_id`, which `model train` sets to the vocab size.
+fn model_read_vocab_v3(path: &Path) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path).ok()?;
+    let mut head = [0u8; 12];
+    f.read_exact(&mut head).ok()?;
+    if &head[..8] != MODEL_MAGIC_V3 { return None; }
+    let blob_len = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as u64;
+    f.seek(SeekFrom::Current(blob_len as i64)).ok()?;
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b).ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+/// Quote `s` for a POSIX shell only when it needs it, so the common case stays
+/// copy-pasteable and readable.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./-+=:@%".contains(&b));
+    if plain { s.to_string() } else { format!("'{}'", s.replace('\'', r"'\''")) }
+}
+
+/// The exact `tokenov model train` command that rebuilds the v3 model at `path`
+/// in place, from the tokenizer and corpus its provenance records. `Err` carries
+/// a reason the command cannot be given (an input file is gone).
+///
+/// Keeps the model where it is and under the registry name it has: `--name` +
+/// default store when the file is `<store>/<name>.ngram`, else `--output` (with
+/// `--name` only if the registered name differs from the file stem, since `model
+/// train` registers under the stem otherwise). `--max-vocab` is added when the
+/// model was capped below its tokenizer's vocab. `vocab` is the model's own vocab
+/// size; `tok_vocab` the embedded tokenizer's.
+fn retrain_command(path: &Path, prov: &Provenance, vocab: Option<u32>, tok_vocab: Option<u32>,
+                   registry: &[registry::ModelEntry], models_dir: &Path) -> std::result::Result<String, String> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let tok = Path::new(&prov.tok_source);
+    let train = Path::new(&prov.train_path);
+    if prov.train_path.is_empty() || !train.exists() {
+        return Err(format!("the corpus it was trained on ({}) no longer exists",
+            if prov.train_path.is_empty() { "<not recorded>" } else { &prov.train_path }));
+    }
+    if prov.tok_source.is_empty() || !tok.exists() {
+        return Err(format!("the tokenizer file it was trained with ({}) no longer exists",
+            if prov.tok_source.is_empty() { "<not recorded>" } else { &prov.tok_source }));
+    }
+    let here = canon(path);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string();
+    let reg_name = registry.iter().find(|e| canon(Path::new(&e.path)) == here).map(|e| e.name.clone());
+    let name = reg_name.clone().unwrap_or_else(|| stem.clone());
+    let in_store = here == canon(&models_dir.join(format!("{name}.ngram")));
+    let mut cmd = format!("tokenov model train --tokenizer {} --train {}",
+        shell_quote(&prov.tok_source), shell_quote(&prov.train_path));
+    if in_store {
+        cmd += &format!(" --name {}", shell_quote(&name));
+    } else {
+        cmd += &format!(" --output {}", shell_quote(&path.display().to_string()));
+        if name != stem { cmd += &format!(" --name {}", shell_quote(&name)); }
+    }
+    if let (Some(v), Some(t)) = (vocab, tok_vocab) {
+        if v < t { cmd += &format!(" --max-vocab {v}"); }
+    }
+    cmd += " --force";
+    Ok(cmd)
+}
+
+/// The retrain advice for a pre-issue-074 v3 model: the exact command when its
+/// inputs still exist, else why not and what to do instead.
+fn retrain_advice(path: &Path, prov: &Provenance, vocab: Option<u32>) -> String {
+    let tok_vocab = Tokenizer::from_bytes(&prov.tokenizer_json).ok().map(|t| t.get_vocab_size(false) as u32);
+    match retrain_command(path, prov, vocab, tok_vocab, &registry::read_registry(), &registry::models_dir()) {
+        Ok(cmd) => format!("To store it fixed and skip this, retrain it:\n  {cmd}"),
+        Err(why) => format!("To store it fixed, retrain it with `tokenov model train` (no exact \
+            command here: {why}). A model built by `tokenov bootstrap` can be rebuilt with \
+            `tokenov bootstrap --rebuild`."),
+    }
+}
+
 fn model_save(path: &Path, model: &Model, provenance: Option<&Provenance>, force: bool) -> Result<()> {
     if path.exists() && !force {
         bail!("output already exists: {} (pass --force to overwrite)", path.display());
@@ -1412,17 +1538,17 @@ fn model_load(path: &Path) -> Result<Model> {
         match prov.as_ref().and_then(|p| rebuild_decode_table(p, decode.len())) {
             Some(fixed) => {
                 warn_msg(&format!(
-                    "note: {} has a decode table predating the issue-074 fix; rebuilt it in \
-                     memory from the model's own embedded tokenizer. Output is correct. \
-                     Retrain with `tokenov model train` to store it fixed and skip this.",
-                    path.display()));
+                    "note: {} was built before tokenov 1.2.0, which stored some multi-byte \
+                     characters as U+FFFD. Rebuilt that table in memory from the model's own \
+                     embedded tokenizer, so output is correct. {}",
+                    path.display(), retrain_advice(path, prov.as_ref().unwrap(), Some(decode.len() as u32))));
                 fixed
             }
             None => {
                 if decode.iter().any(|e| e.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD])) {
                     warn_msg(&format!(
-                        "warning: {} is {} and carries a decode table predating the issue-074 \
-                         fix. Candidates containing a multi-byte character may be emitted with \
+                        "warning: {} is {} and was built before tokenov 1.2.0, which stored some \
+                         multi-byte characters as U+FFFD. Candidates containing a multi-byte character may be emitted with \
                          U+FFFD in place of the real bytes. This format embeds no tokenizer, so \
                          it cannot be repaired automatically — retrain with \
                          `tokenov model train` to fix it.", path.display(), fmt));
@@ -2020,7 +2146,7 @@ fn run_delete(args: DeleteArgs) -> Result<()> {
                 (None, Some(p))
             } else {
                 bail!("'{}' is neither a registered model name nor an existing file \
-                       (see `tokenov --list-models`)", name);
+                       (see `tokenov model`)", name);
             }
         }
     };
@@ -3023,10 +3149,31 @@ fn validate_min_level(min_level: u32, run_graft: bool, float: bool) -> Result<()
     Ok(())
 }
 
+/// The warning for a `--wordlist --enterprise` run that finished short: fewer
+/// candidates than `--count`, or none at all when unbounded. `None` = no warning.
+///
+/// The graft generator promises this (an `--enterprise` run must not end
+/// short silently); the --rare-first generator keeps the promise. It only ends
+/// short when every word's affix space, bounded by --max-tokens / --max-len, is
+/// exhausted or dropped. Resumed runs are skipped: `emitted` counts this
+/// session only, so the comparison would be wrong.
+fn wordlist_shortfall_warning(enterprise: bool, resumed: bool, count: Option<u64>,
+                              emitted: u64, prepend_only: bool) -> Option<String> {
+    if !enterprise || resumed { return None; }
+    let short = match count { Some(t) => emitted < t, None => emitted == 0 };
+    if !short { return None; }
+    let wanted = match count { Some(t) => format!(" of the {t} requested"), None => String::new() };
+    let why = if prepend_only {
+        "--prepend-only only adds a PREFIX, so many candidates never reach 3 of \
+         {lower, upper, digit, special}. "
+    } else { "" };
+    Some(format!("warning: --enterprise kept only {emitted}{wanted} candidates — every \
+        wordlist word ran out of policy-compliant candidates within --max-tokens / \
+        --max-len. {why}Raise --max-tokens or --max-len, or add words."))
+}
+
 /// Parse `--case-shape` into its patterns. Empty = default single lowercase
-/// emission (byte-identical to the prior path). Shared because the graft
-/// generator branches out of `run_generate` before the enumerator's own
-/// construction point.
+/// emission (byte-identical to the prior path).
 fn parse_case_masks(spec: &Option<String>) -> Result<Vec<CaseMask>> {
     match spec {
         Some(spec) => {
@@ -3076,6 +3223,32 @@ fn ignore_graft_flags(args: &mut GenerateArgs, run_graft: bool) {
         if bad.len() == 1 { "it" } else { "them" }));
 }
 
+/// `--rare-first`: the side the rarity-first generator (wordlist.rs) runs on,
+/// or `None` when the run doesn't use it. Its tuning flags need it: without
+/// --rare-first a `--wordlist` run uses the seeded enumerator (bare /
+/// --append-only) or the graft generator (--float / --prepend-only), neither
+/// of which reads them. Call after the side flags are checked for exclusivity.
+fn wordlist_side(args: &GenerateArgs) -> Result<Option<wordlist::Side>> {
+    if !args.rare_first {
+        for (set, f) in [(args.mix, "--mix"), (args.no_split, "--no-split"),
+                         (args.rarity_weight != 1.0, "--rarity-weight")] {
+            if set { bail!("{f} only applies with --rare-first"); }
+        }
+        return Ok(None);
+    }
+    if args.wordlist.is_none() { bail!("--rare-first needs --wordlist"); }
+    if args.mode.is_some() {
+        bail!("--mode (legacy) cannot be combined with --rare-first — they select \
+               different generators. Drop one of them.");
+    }
+    if !(args.rarity_weight >= 0.0 && args.rarity_weight.is_finite()) {
+        bail!("--rarity-weight must be a finite number >= 0 (got {})", args.rarity_weight);
+    }
+    Ok(Some(if args.append_only { wordlist::Side::Append }
+        else if args.prepend_only { wordlist::Side::Prepend }
+        else { wordlist::Side::Float }))
+}
+
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // `tokenov generate --sessions` / `--resume-session` behave exactly like the
     // top-level spellings instead of erroring (issue-064 item 6).
@@ -3104,11 +3277,9 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // `generate` — fast mode writes directly to the sink, and --strict is clamped
     // to one thread (also no merger). They survive only for the hidden `calibrate`
     // subcommand. Say so instead of silently ignoring them.
-    if args.merge_chunk_size.is_some() || args.no_auto_tune || args.runtime_tune {
-        warn_msg("warning: --merge-chunk-size / --no-auto-tune / --runtime-tune \
-                  have no effect on `generate` (no merger runs: fast mode writes directly, \
-                  --strict is single-threaded). They apply to `tokenov calibrate` only. \
-                  The live fast-mode knob is --flush-bytes.");
+    if args.merge_chunk_size.is_some() || args.no_auto_tune || args.runtime_tune || args.retune {
+        warn_msg("warning: --merge-chunk-size / --no-auto-tune / --runtime-tune / --retune \
+                  have no effect on `generate` and are ignored.");
     }
     if args.min_tokens < 1 {
         bail!("--min-tokens must be >= 1");
@@ -3121,8 +3292,9 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // appended) — the seeded walk, routed through the seeded machinery, and
     // --append-only is that default's explicit spelling (hence a no-op). The
     // graft generator (rarity-weighted, affixes on either side) is opt-in via
-    // --float; --prepend-only is the prepend graft. --mode is the legacy opt-in
-    // (weighted/seeded/combined).
+    // --float; --prepend-only is the prepend graft. --rare-first selects the
+    // rarity-first generator (wordlist.rs) instead, on the side the three flags
+    // name (default both). --mode is the legacy opt-in (weighted/seeded/combined).
     if [args.append_only, args.prepend_only, args.float].iter().filter(|&&x| x).count() > 1 {
         bail!("--append-only, --prepend-only, and --float are mutually exclusive");
     }
@@ -3136,12 +3308,23 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             if args.float { "--float" } else { "--prepend-only" },
             if args.float { "--float" } else { "--prepend-only" });
     }
-    let run_graft = args.wordlist.is_some() && args.mode.is_none()
+    let wl_side = wordlist_side(&args)?;
+    if args.wordlist.is_none() {
+        let named: Vec<&str> = [(args.append_only, "--append-only"),
+            (args.prepend_only, "--prepend-only"), (args.float, "--float")]
+            .iter().filter(|(on, _)| *on).map(|(_, f)| *f).collect();
+        if !named.is_empty() {
+            warn_msg(&format!("warning: {} has no effect without --wordlist (ignored)",
+                named.join(", ")));
+        }
+    }
+    let run_graft = args.wordlist.is_some() && args.mode.is_none() && !args.rare_first
         && (args.prepend_only || args.float);
     validate_min_level(args.min_level, run_graft, args.float)?;
     ignore_graft_flags(&mut args, run_graft);
-    // Concrete mode for the legacy machinery + the graft generator's unbiased
-    // model prep. None → Seeded (unbiased; --append-only is exactly seeded).
+    // Concrete mode for the legacy machinery + the graft and rarity-first
+    // generators' unbiased model prep. None → Seeded (unbiased; --append-only
+    // is exactly seeded).
     let legacy_mode: Mode = args.mode.unwrap_or(Mode::Seeded);
 
     if args.wordlist.is_none() {
@@ -3189,9 +3372,9 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // unmodified original (for seeded). For KN models in weighted/combined,
     // the bias is computed via `apply_weighted_bias_kn_aware` so the joint
     // emission distribution per context is properly renormalized to sum to 1.
-    let (post_bias_model, entry_seqs_opt, _w_set): (Model,
+    let (post_bias_model, entry_seqs_opt, _w_set, wl_tokenizer): (Model,
                                                     Option<Vec<Vec<u32>>>,
-                                                    FxHashMap<u32, ()>) = match args.wordlist.as_ref() {
+                                                    FxHashMap<u32, ()>, Option<Tokenizer>) = match args.wordlist.as_ref() {
         None => {
             // Standard mode — clone the loaded model unchanged. No bias.
             let m = Model {
@@ -3206,7 +3389,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                 unigram_raw: model.unigram_raw.clone(),
                 unigram_kn_cont: model.unigram_kn_cont.clone(),
             };
-            (m, None, FxHashMap::default())
+            (m, None, FxHashMap::default(), None)
         }
         Some(p) => {
             let wordlist = read_wordlist(p)?;
@@ -3280,8 +3463,8 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                         unigram_kn_cont: model.unigram_kn_cont.clone(),
                     }
                 }
-                // Seeded (and the default graft generator) run the model
-                // unbiased. The graft path branches out below before enumeration.
+                // Seeded (and the graft and --rare-first generators) run the model
+                // unbiased.
                 Mode::Seeded => Model {
                     contexts: model.contexts.clone(),
                     decode: model.decode.clone(),
@@ -3295,7 +3478,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     unigram_kn_cont: model.unigram_kn_cont.clone(),
                 },
             };
-            (m, Some(entry_seqs), w_set)
+            (m, Some(entry_seqs), w_set, Some(tokenizer))
         }
     };
     let mut enum_model = variant.prepare(&post_bias_model, unigram_logw);
@@ -3339,8 +3522,35 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
 
     // Phase 3: derive seeds from wordlist (if seeded/combined) using the
     // EnumModel (so back-off is honored when computing joint log-probs).
-    let seeds: Vec<HeapEntry> = match (&entry_seqs_opt, legacy_mode) {
-        (Some(entry_seqs), Mode::Seeded) | (Some(entry_seqs), Mode::Combined) => {
+    //
+    // The rarity-first wordlist generator builds its anchor plan here instead —
+    // before the FULL-cache trigram drop, since anchor surprisal reads trigram.
+    // Its seeds are one work unit per anchor (see wordlist::initial_states).
+    let wl_plan: Option<Arc<wordlist::Plan>> = match (&entry_seqs_opt, wl_side) {
+        (Some(entry_seqs), Some(side)) => {
+            // Re-tokenizes a word's lowercase form: the stand-in continuation
+            // context for a word whose own last token the model never saw
+            // followed by anything (`Government` → `government`).
+            let tok = wl_tokenizer.as_ref().expect("wordlist implies a tokenizer");
+            let start_id = model.start_id;
+            let lower = |s: &str| -> Vec<u32> {
+                tok.encode(s.to_lowercase().as_str(), false)
+                    .map(|e| e.get_ids().iter().filter(|&&id| id < start_id).copied().collect())
+                    .unwrap_or_default()
+            };
+            Some(Arc::new(wordlist::build_plan(
+                &enum_model, &*variant, &model, entry_seqs, &lower,
+                &wordlist::PlanOpts {
+                    side, mix: args.mix, split: !args.no_split,
+                    rarity_weight: args.rarity_weight, max_tokens: args.max_tokens,
+                })?))
+        }
+        _ => None,
+    };
+    drop(wl_tokenizer);
+    let seeds: Vec<HeapEntry> = match (&entry_seqs_opt, legacy_mode, &wl_plan) {
+        (_, _, Some(plan)) => wordlist::initial_states(plan),
+        (Some(entry_seqs), Mode::Seeded, None) | (Some(entry_seqs), Mode::Combined, None) => {
             build_seeds(&enum_model, entry_seqs, &_w_set, args.seed_mode,
                 model.start_id, args.max_tokens)
         }
@@ -3645,6 +3855,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     let _ = write_progress(pp, ck.emitted, bytes, &args_fp);
                 }
             },
+            wl_plan.as_deref(),
         );
         let (sink, _) = shared.into_inner();
         sink.finish()?;
@@ -3657,6 +3868,12 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     let _ = std::fs::remove_file(cp);
                 } else {
                     let _ = write_checkpoint(cp, &ckpt_fp, &[CkptSlot::Done]);
+                }
+            }
+            if wl_plan.is_some() {
+                if let Some(w) = wordlist_shortfall_warning(args.enterprise,
+                        args.resume || resume_from.is_some(), args.count, emitted, args.prepend_only) {
+                    warn_msg(&w);
                 }
             }
         }
@@ -3748,6 +3965,10 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         let h = format!("[gen] domain decomp: {} first-level tokens → {} static partitions",
             first_level.len(), n_threads);
         (assign_partitions(first_level.clone(), n_threads), h)
+    } else if wl_plan.is_some() {
+        let h = format!("[gen] domain decomp: {} wordlist anchors → {} static partitions",
+            seeds.len(), n_threads);
+        (wordlist::partition(seeds, n_threads), h)
     } else {
         let h = format!("[gen] domain decomp: {} seeds → {} static partitions",
             seeds.len(), n_threads);
@@ -3770,6 +3991,13 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // and this is byte-identical to the previous behaviour.
     let n_active = partitions.iter().filter(|p| !p.is_empty()).count().max(1);
     let thread_target = target_count.div_ceil(n_active as u64);
+    // Wordlist mode splits the budget by rarity instead (∝ Σ surprisal^p of each
+    // partition's anchors): an equal split would give a thread holding one
+    // common word as much output as a thread holding one rare word.
+    let thread_targets: Vec<u64> = match &wl_plan {
+        Some(plan) => wordlist::quotas(plan, &partitions, target_count),
+        None => vec![thread_target; partitions.len()],
+    };
 
     // active_target: how many workers should remain alive. Starts at n_threads;
     // the mem_monitor decrements it on soft-RSS breach; workers >= active_target
@@ -4012,6 +4240,8 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                 let sink  = Arc::clone(&sink);
                 let stats = Arc::clone(&stats);
                 let my_resume = worker_resume[thread_id].clone();
+                let my_target = thread_targets[thread_id];
+                let wl        = wl_plan.clone();
                 let done      = worker_done[thread_id];
                 let slots_w   = Arc::clone(&slots);
                 let cp_every  = ckpt_path.as_ref().map(|_| Duration::from_secs(ckpt_secs));
@@ -4043,7 +4273,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     });
                     let res = enumerate_to_sink(
                         &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
-                        states, max_tokens, min_tokens, min_len, max_len, min_level, thread_target, enterprise, &cm,
+                        states, max_tokens, min_tokens, min_len, max_len, min_level, my_target, enterprise, &cm,
                         |_lvl, _sk, bytes| {
                             let mut e = em_cell.borrow_mut();
                             e.buf.extend_from_slice(bytes);
@@ -4065,6 +4295,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                             let _ = emitter_flush(&mut em_cell.borrow_mut(), &sink, &stats, true);
                             *slots_w[thread_id].lock().unwrap() = CkptSlot::InProgress(ck.clone());
                         },
+                        wl.as_deref(),
                     );
                     if res.is_ok() {
                         // Push the final partial buffer (the outer scope flushes the
@@ -4121,6 +4352,13 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         }
         log_msg(&format!("[gen] fast mode: total emitted = {}",
             stats.emitted.load(AtomicOrdering::Relaxed)));
+        if wl_plan.is_some() {
+            if let Some(w) = wordlist_shortfall_warning(args.enterprise,
+                    args.resume || resume_from.is_some(), args.count,
+                    stats.emitted.load(AtomicOrdering::Relaxed), args.prepend_only) {
+                warn_msg(&w);
+            }
+        }
         return Ok(());
     }
 
@@ -4264,6 +4502,8 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             let cs  = Arc::clone(&chunk_size_atomic);
             let var = Arc::clone(&variant);
             let cm  = case_masks.clone();  // tiny per-worker copy of the case masks
+            let my_target = thread_targets[thread_id];
+            let wl  = wl_plan.clone();
             worker_handles.push(scope.spawn(move || -> Result<()> {
                 let label = format!("[t{}] ", thread_id);
                 let mut chunk_sender = ChunkSender::new(tx, cs);
@@ -4271,12 +4511,13 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                     &em, &*var, cc, cache_mode, &dt, kind, start_id, end_id,
                     states, max_tokens, min_tokens, min_len, max_len,
                     min_level,
-                    thread_target,
+                    my_target,
                     enterprise,
                     &cm,
                     |lvl, sk, bytes| chunk_sender.push(lvl, sk, bytes),
                     &label,
                     None, None, |_: &ThreadCkpt| {},
+                    wl.as_deref(),
                 );
                 // Flush the trailing partial chunk before the ChunkSender (and
                 // its channel sender) drops, signaling end-of-stream. Don't
@@ -5055,6 +5296,13 @@ fn build_args_fingerprint(
     if args.min_level > 0 {
         write!(s, " min_level={}", args.min_level).unwrap();
     }
+    // --rare-first is a different generator over the same flags, so tag it: a
+    // seeded-walk progress sidecar must never splice into a rare-first stream.
+    // Every other fingerprint is unchanged.
+    if args.wordlist.is_some() && args.rare_first {
+        write!(s, " wordlist_gen=rare_first rarity_weight={} mix={} split={}",
+            args.rarity_weight, args.mix, !args.no_split).unwrap();
+    }
     Ok(s)
 }
 
@@ -5157,6 +5405,9 @@ struct ThreadCkpt {
     prefix:       Vec<u32>,
     idx_stack:    Vec<usize>,
     emitted:      u64,
+    /// Wordlist mode: one position per anchor stream (the single-position
+    /// fields above are unused there). Empty for every other mode.
+    streams:      Vec<wordlist::StreamCkpt>,
 }
 
 /// Per-thread slot the writer serializes. `NotStarted` = worker hasn't published
@@ -5201,6 +5452,9 @@ fn write_checkpoint(path: &Path, fingerprint: &str, slots: &[CkptSlot]) -> Resul
                 writeln!(s, "emitted={}", c.emitted).unwrap();
                 writeln!(s, "prefix={}", csv_join(&c.prefix)).unwrap();
                 writeln!(s, "idx_stack={}", csv_join(&c.idx_stack)).unwrap();
+                for st in &c.streams {
+                    writeln!(s, "stream={}", st.to_field()).unwrap();
+                }
             }
         }
     }
@@ -5229,7 +5483,9 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
     let mut sec_status: Option<String> = None;
     let mut sec_tl = 0u32; let mut sec_ii = 0usize; let mut sec_em = 0u64;
     let mut sec_prefix: Vec<u32> = vec![]; let mut sec_idx: Vec<usize> = vec![];
+    let mut sec_streams: Vec<wordlist::StreamCkpt> = vec![];
     let flush = |status: &Option<String>, tl, ii, em, prefix: &Vec<u32>, idx: &Vec<usize>,
+                 streams: &Vec<wordlist::StreamCkpt>,
                  slots: &mut Vec<CkptSlot>| -> Result<()> {
         match status.as_deref() {
             None => {}
@@ -5237,7 +5493,7 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
             Some("done")        => slots.push(CkptSlot::Done),
             Some("in_progress") => slots.push(CkptSlot::InProgress(ThreadCkpt {
                 target_level: tl, init_idx: ii, emitted: em,
-                prefix: prefix.clone(), idx_stack: idx.clone(),
+                prefix: prefix.clone(), idx_stack: idx.clone(), streams: streams.clone(),
             })),
             Some(other) => bail!("checkpoint: unknown status '{}'", other),
         }
@@ -5247,9 +5503,9 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
         if line.starts_with("[thread=") {
-            flush(&sec_status, sec_tl, sec_ii, sec_em, &sec_prefix, &sec_idx, &mut slots)?;
+            flush(&sec_status, sec_tl, sec_ii, sec_em, &sec_prefix, &sec_idx, &sec_streams, &mut slots)?;
             sec_status = None; sec_tl = 0; sec_ii = 0; sec_em = 0;
-            sec_prefix.clear(); sec_idx.clear();
+            sec_prefix.clear(); sec_idx.clear(); sec_streams.clear();
             continue;
         }
         let (k, v) = line.split_once('=').ok_or_else(|| anyhow!("checkpoint: bad line '{}'", line))?;
@@ -5264,10 +5520,11 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
             "emitted"      => sec_em = v.parse()?,
             "prefix"       => sec_prefix = parse_csv_u32(v)?,
             "idx_stack"    => sec_idx = parse_csv_usize(v)?,
+            "stream"       => sec_streams.push(wordlist::StreamCkpt::from_field(v)?),
             _              => {} // tolerate unknown keys
         }
     }
-    flush(&sec_status, sec_tl, sec_ii, sec_em, &sec_prefix, &sec_idx, &mut slots)?;
+    flush(&sec_status, sec_tl, sec_ii, sec_em, &sec_prefix, &sec_idx, &sec_streams, &mut slots)?;
     if threads != 0 && slots.len() != threads {
         bail!("checkpoint: header threads={} but found {} thread sections", threads, slots.len());
     }
@@ -5533,12 +5790,21 @@ fn resume_session(id: &str) -> Result<()> {
     let exe = std::env::current_exe().context("current_exe")?;
     log_msg(&format!("[sessions] resuming {} → {} {} --resume-state {}",
         id, exe.display(), rec.argv.join(" "), rec.checkpoint_file));
-    use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new(exe)
-        .args(&rec.argv)
-        .arg("--resume-state").arg(&rec.checkpoint_file)
-        .exec(); // replaces this process on success
-    Err(anyhow!("exec failed: {}", err))
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&rec.argv).arg("--resume-state").arg(&rec.checkpoint_file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec(); // replaces this process on success
+        Err(anyhow!("exec failed: {}", err))
+    }
+    // No exec on Windows: run the resumed command as a child and pass its
+    // exit code through.
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status().context("starting the resumed run")?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 /// Convert a (negative) transition log-prob to its discrete level.
@@ -5732,12 +5998,25 @@ fn enumerate_to_sink<F, H>(
     // on that cadence. All three are inert (None/None/no-op) for non-resumable runs.
     resume: Option<ThreadCkpt>,
     checkpoint_every: Option<Duration>,
-    mut on_checkpoint: H,
+    on_checkpoint: H,
+    // `--wordlist --rare-first`: the states are wordlist anchors, walked by the
+    // rarity-first hybrid DFS in wordlist.rs. Dispatched here so every caller's
+    // thread / strict / checkpoint plumbing is shared unchanged.
+    wordlist_plan: Option<&wordlist::Plan>,
 ) -> Result<()>
 where
     F: FnMut(u32, u32, &[u8]) -> Result<()>,
     H: FnMut(&ThreadCkpt),
 {
+    if let Some(plan) = wordlist_plan {
+        let _ = max_tokens; // per-anchor caps live in the plan
+        return wordlist::enumerate(
+            plan, enum_model, variant, child_cache, cache_mode, decode_table, kind,
+            start_id, initial_states, min_tokens, min_len, max_len, min_level,
+            target_count, enterprise, case_masks, emit, thread_label,
+            resume, checkpoint_every, on_checkpoint);
+    }
+    let mut on_checkpoint = on_checkpoint;
 
     let t0 = Instant::now();
     let mut last_log = Instant::now();
@@ -5953,7 +6232,7 @@ where
                         let idx_stack: Vec<usize> = stack.iter().map(|f| f.idx).collect();
                         on_checkpoint(&ThreadCkpt {
                             target_level, init_idx: ii,
-                            prefix: prefix.clone(), idx_stack, emitted,
+                            prefix: prefix.clone(), idx_stack, emitted, streams: Vec::new(),
                         });
                         last_ckpt = Instant::now();
                     }
@@ -6285,17 +6564,16 @@ pub struct ScoreArgs {
     #[arg(long, default_value = "a", hide = true)]
     variant: String,
 
-    /// Report `+inf` for candidates the model assigns zero mass (what `generate`
-    /// in its default mode can never emit), instead of the default finite floored Rarity.
-    /// Default scoring backs off to a full-vocab add-k unigram floor so every
-    /// password gets a finite probability; `--reachable` restores the old
-    /// zero-mass reachability behavior (needed to reproduce +inf-gap analyses).
+    /// Report `+inf` for candidates `generate` can never produce, instead of
+    /// the default finite score. By default, a step the model has never seen
+    /// gets a small fallback probability, so every password gets a finite
+    /// Rarity.
     #[arg(long)]
     reachable: bool,
 
     /// Add a per-position `Segment Score` column to the table: each token (and
-    /// the terminal END) annotated with the surprisal it contributes in bits,
-    /// with a `*` marking off-support (floored) steps. Off by default to keep
+    /// the end of the password) annotated with the Rarity it contributes in
+    /// bits, with a `*` marking steps that used the fallback probability. Off by default to keep
     /// the table compact. No effect on `--format tsv`/`jsonl`, which always
     /// carry the per-position data.
     #[arg(short = 'd', long)]
@@ -7233,6 +7511,7 @@ fn do_calibration(
                     },
                     &label,
                     None, None, |_: &ThreadCkpt| {},
+                    None, // calibration measures standard-mode throughput
                 );
                 if res.is_ok() {
                     chunk_sender.flush()?;
@@ -7589,9 +7868,11 @@ fn run_model_info(args: InfoArgs) -> Result<()> {
             if prov.decode_exact {
                 println!("decode table:      byte-exact");
             } else {
-                println!("decode table:      pre-issue-074 (multi-byte tokens stored as U+FFFD);");
+                println!("decode table:      from before 1.2.0 (some multi-byte characters stored as U+FFFD);");
                 println!("                   repaired in memory at load from the embedded tokenizer.");
-                println!("                   Retrain with `tokenov model train` to store it fixed.");
+                for line in retrain_advice(&path, &prov, model_read_vocab_v3(&path)).lines() {
+                    println!("                   {}", line.trim_start());
+                }
             }
             println!("tokenizer:         embedded, {} bytes, vocab_size {}",
                 prov.tokenizer_json.len(), vocab);
@@ -7602,7 +7883,7 @@ fn run_model_info(args: InfoArgs) -> Result<()> {
         }
         None => {
             println!("format:            NGRMv001/002 (older format — no embedded tokenizer)");
-            println!("decode table:      pre-issue-074 and NOT repairable (no embedded tokenizer):");
+            println!("decode table:      from before 1.2.0 and NOT repairable (no embedded tokenizer):");
             println!("                   multi-byte characters may emit as U+FFFD. Rebuild to fix.");
             println!("note:              built by an older tokenov; the tokenizer is not embedded.");
             println!("                   Rebuild with a current tokenov to embed it, or for");
@@ -8026,7 +8307,7 @@ mod prov_tests {
 
 #[cfg(test)]
 mod count_parse_tests {
-    use super::parse_count;
+    use super::{parse_count, parse_count_u32, parse_count_usize};
 
     #[test]
     fn bare_integers_unchanged() {
@@ -8090,6 +8371,17 @@ mod count_parse_tests {
     fn rejects_overflow() {
         assert!(parse_count("99999999999999999999T").is_err());
         assert!(parse_count("18446744073709551616").is_err()); // u64::MAX + 1
+    }
+
+    #[test]
+    fn narrow_count_parsers() {
+        assert_eq!(parse_count_usize("8000"), Ok(8000));
+        assert_eq!(parse_count_usize("8K"), Ok(8000));
+        assert_eq!(parse_count_usize("32k"), Ok(32_000));
+        assert_eq!(parse_count_u32("50K"), Ok(50_000));
+        assert_eq!(parse_count_u32("4294967295"), Ok(u32::MAX));
+        assert!(parse_count_u32("5B").is_err());
+        assert!(parse_count_usize("8X").is_err());
     }
 }
 
@@ -8159,4 +8451,169 @@ mod graft_flag_tests {
     }
 }
 
+#[cfg(test)]
+mod wordlist_side_tests {
+    use super::{wordlist_side, GenerateArgs, Mode};
+    use crate::wordlist::Side;
 
+    fn wl() -> GenerateArgs {
+        GenerateArgs { wordlist: Some("w.txt".into()), rarity_weight: 1.0, ..Default::default() }
+    }
+    fn rf() -> GenerateArgs { GenerateArgs { rare_first: true, ..wl() } }
+
+    /// Without --rare-first the 1.x generators run: no rarity-first side.
+    #[test]
+    fn default_wordlist_is_not_rare_first() {
+        assert_eq!(wordlist_side(&wl()).unwrap(), None);
+        assert_eq!(wordlist_side(&GenerateArgs { float: true, ..wl() }).unwrap(), None);
+        assert_eq!(wordlist_side(&GenerateArgs { append_only: true, ..wl() }).unwrap(), None);
+    }
+
+    #[test]
+    fn rare_first_sides() {
+        assert_eq!(wordlist_side(&rf()).unwrap(), Some(Side::Float));
+        assert_eq!(wordlist_side(&GenerateArgs { float: true, ..rf() }).unwrap(), Some(Side::Float));
+        assert_eq!(wordlist_side(&GenerateArgs { append_only: true, ..rf() }).unwrap(), Some(Side::Append));
+        assert_eq!(wordlist_side(&GenerateArgs { prepend_only: true, ..rf() }).unwrap(), Some(Side::Prepend));
+    }
+
+    #[test]
+    fn rare_first_needs_wordlist_and_no_mode() {
+        let no_wl = GenerateArgs { wordlist: None, ..rf() };
+        assert!(wordlist_side(&no_wl).is_err());
+        assert!(wordlist_side(&GenerateArgs { mode: Some(Mode::Seeded), ..rf() }).is_err());
+    }
+
+    #[test]
+    fn tuning_flags_need_rare_first() {
+        assert!(wordlist_side(&GenerateArgs { mix: true, ..wl() }).is_err());
+        assert!(wordlist_side(&GenerateArgs { no_split: true, ..wl() }).is_err());
+        assert!(wordlist_side(&GenerateArgs { rarity_weight: 2.0, ..wl() }).is_err());
+        assert!(wordlist_side(&GenerateArgs { mix: true, no_split: true, rarity_weight: 2.0, ..rf() }).is_ok());
+    }
+
+    #[test]
+    fn rarity_weight_must_be_non_negative() {
+        assert!(wordlist_side(&GenerateArgs { rarity_weight: -1.0, ..rf() }).is_err());
+        assert!(wordlist_side(&GenerateArgs { rarity_weight: f32::NAN, ..rf() }).is_err());
+        assert!(wordlist_side(&GenerateArgs { rarity_weight: 0.0, ..rf() }).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod wordlist_shortfall_tests {
+    use super::wordlist_shortfall_warning as w;
+
+    /// The graft generator's contract, kept by --rare-first: a short
+    /// `--enterprise` wordlist run warns.
+    #[test]
+    fn short_enterprise_run_warns() {
+        let m = w(true, false, Some(1000), 12, false).expect("warns");
+        assert!(m.contains("kept only 12 of the 1000 requested"), "{m}");
+        assert!(!m.contains("PREFIX"), "{m}");
+        assert!(w(true, false, Some(1000), 12, true).unwrap().contains("PREFIX"));
+        // Unbounded: only an empty run is short.
+        assert!(w(true, false, None, 0, false).is_some());
+        assert!(w(true, false, None, 5, false).is_none());
+    }
+
+    #[test]
+    fn no_warning_when_met_off_or_resumed() {
+        assert!(w(true, false, Some(1000), 1000, false).is_none());
+        assert!(w(false, false, Some(1000), 12, false).is_none());
+        // A resumed run's counter covers this session only.
+        assert!(w(true, true, Some(1000), 12, false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod retrain_command_tests {
+    use super::{retrain_command, shell_quote, Provenance};
+    use crate::registry::ModelEntry;
+    use std::path::{Path, PathBuf};
+
+    struct Env { dir: PathBuf, store: PathBuf, prov: Provenance }
+
+    fn env(tag: &str) -> Env {
+        let dir = std::env::temp_dir().join(format!("tokenov_retrain_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("models");
+        std::fs::create_dir_all(&store).unwrap();
+        let tok = dir.join("tok.json");
+        let train = dir.join("corpus.txt");
+        std::fs::write(&tok, b"{}").unwrap();
+        std::fs::write(&train, b"pw\n").unwrap();
+        let prov = Provenance {
+            tokenizer_json: Vec::new(),
+            tok_source: tok.display().to_string(),
+            train_path: train.display().to_string(),
+            build_epoch: 0, binver: "0.18.0".into(), decode_exact: false,
+        };
+        Env { dir, store, prov }
+    }
+
+    fn entry(name: &str, path: &Path) -> ModelEntry {
+        ModelEntry { name: name.into(), path: path.display().to_string(),
+                     size_bytes: 0, built_epoch: 0, sha256: None }
+    }
+
+    /// The default model: in the store under its own name → `--name`, no `--output`.
+    #[test]
+    fn store_model_uses_name() {
+        let e = env("store");
+        let m = e.store.join("tokenov_v1.ngram");
+        std::fs::write(&m, b"x").unwrap();
+        let c = retrain_command(&m, &e.prov, Some(50257), Some(50257),
+                                &[entry("tokenov_v1", &m)], &e.store).unwrap();
+        assert_eq!(c, format!("tokenov model train --tokenizer {} --train {} --name tokenov_v1 --force",
+                              e.prov.tok_source, e.prov.train_path));
+        let _ = std::fs::remove_dir_all(&e.dir);
+    }
+
+    /// Outside the store: `--output` keeps the file in place; `--name` appears
+    /// only when the registered name differs from the stem.
+    #[test]
+    fn outside_store_uses_output_and_keeps_registered_name() {
+        let e = env("out");
+        let m = e.dir.join("my model.ngram");
+        std::fs::write(&m, b"x").unwrap();
+        let c = retrain_command(&m, &e.prov, None, None, &[entry("research", &m)], &e.store).unwrap();
+        assert!(c.contains(&format!("--output '{}'", m.display())), "{c}");
+        assert!(c.contains("--name research"), "{c}");
+        let c2 = retrain_command(&m, &e.prov, None, None, &[], &e.store).unwrap();
+        assert!(!c2.contains("--name"), "{c2}");
+        let _ = std::fs::remove_dir_all(&e.dir);
+    }
+
+    /// A model capped below its tokenizer's vocab is rebuilt with the same cap.
+    #[test]
+    fn capped_vocab_adds_max_vocab() {
+        let e = env("cap");
+        let m = e.store.join("small.ngram");
+        let c = retrain_command(&m, &e.prov, Some(8000), Some(50257), &[], &e.store).unwrap();
+        assert!(c.contains("--max-vocab 8000"), "{c}");
+        let _ = std::fs::remove_dir_all(&e.dir);
+    }
+
+    /// No command for inputs that are gone: it would fail when pasted.
+    #[test]
+    fn missing_inputs_give_a_reason() {
+        let e = env("gone");
+        let m = e.store.join("m.ngram");
+        let train = e.prov.train_path.clone();
+        let mut p = e.prov;
+        p.train_path = e.dir.join("nope.txt").display().to_string();
+        assert!(retrain_command(&m, &p, None, None, &[], &e.store).unwrap_err().contains("corpus"));
+        p.train_path = train;
+        p.tok_source = String::new();
+        assert!(retrain_command(&m, &p, None, None, &[], &e.store).unwrap_err().contains("tokenizer"));
+        let _ = std::fs::remove_dir_all(&e.dir);
+    }
+
+    #[test]
+    fn quotes_only_when_needed() {
+        assert_eq!(shell_quote("/home/a/tok.json"), "/home/a/tok.json");
+        assert_eq!(shell_quote("/a b/c"), "'/a b/c'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+}

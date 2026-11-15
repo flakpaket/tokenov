@@ -252,14 +252,14 @@ pub fn resolve_model(arg: &Path) -> anyhow::Result<PathBuf> {
             }
             anyhow::bail!(
                 "model '{}' is registered but its file is missing: {} \
-                 (rebuild it; see `tokenov --list-models`)",
+                 (rebuild it; see `tokenov model`)",
                 name, e.path
             );
         }
     }
     anyhow::bail!(
         "'{}' is neither an existing file nor a registered model name \
-         (see `tokenov --list-models`)",
+         (see `tokenov model`)",
         name
     );
 }

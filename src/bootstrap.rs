@@ -546,11 +546,13 @@ fn human_size(b: u64) -> String {
 #[derive(clap::Args, Debug, Clone)]
 pub struct BootstrapArgs {
     /// Tokenizer to use: a manifest alias, a tokenizer.json URL, or a local
-    /// path. Default: the manifest's `default_alias`.
+    /// path. Default: the default tokenizer (`tokenov_v1` unless changed with
+    /// `tokenov tokenizer set-default`).
     #[arg(long)]
     pub tokenizer: Option<String>,
 
-    /// Registry name for the built model. Default: `<alias>-quickstart`.
+    /// Registry name for the built model. Default: the tokenizer alias (e.g.
+    /// `tokenov_v1`).
     #[arg(long)]
     pub name: Option<String>,
 
@@ -567,13 +569,19 @@ pub struct BootstrapArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Skip the plan print and run silently-enough for CI.
+    /// Don't print the plan or ask for confirmation (for scripts and CI).
     #[arg(short = 'y', long)]
     pub yes: bool,
 
     /// Re-download / re-expand / rebuild even if cached artifacts exist.
     #[arg(long)]
     pub force: bool,
+
+    /// Rebuild the model even though it exists, reusing the cached tokenizer and
+    /// corpus (only what is missing is downloaded). Use after upgrading tokenov to
+    /// store the model in the current format. `--force` also re-downloads.
+    #[arg(long)]
+    pub rebuild: bool,
 }
 
 pub fn run_bootstrap(args: BootstrapArgs) -> Result<()> {
@@ -597,8 +605,19 @@ pub fn run_bootstrap(args: BootstrapArgs) -> Result<()> {
     print_plan(&alias, &tok_source, &rockyou_url, &tok_path, &corpus_path, &model_name, &model_path);
 
     if args.dry_run {
+        if model_path.exists() && !args.force && !args.rebuild {
+            println!("\n[dry-run] model '{}' already exists; a real run would stop here \
+                      (pass --rebuild to retrain it from the cache).", model_name);
+        }
         println!("\n[dry-run] no network calls or writes performed.");
         return Ok(());
+    }
+    // Stop before any download: the train step would refuse to overwrite anyway,
+    // and its own hint (`--force`) would mean re-downloading RockYou here.
+    if model_path.exists() && !args.force && !args.rebuild {
+        bail!("model '{}' already exists at {}. Pass --rebuild to retrain it from the cached \
+               tokenizer and corpus (no download), or --force to re-download everything and \
+               retrain.", model_name, model_path.display());
     }
     if !args.yes {
         println!("\nProceeding automatically (Ctrl-C to abort; --dry-run to preview only).\n");
@@ -627,7 +646,9 @@ pub fn run_bootstrap(args: BootstrapArgs) -> Result<()> {
         // Bundled "Tokenov tokenizer v1" (GPT-2 + {1,2}): write the embedded bytes
         // to the cache, no network. Idempotent like the Url arm.
         TokSource::Bundled(bytes, label) => {
-            if tok_path.exists() && !args.force {
+            // Bundled bytes cost no network, so --rebuild refreshes them too: the
+            // rebuilt model then embeds this binary's tokenizer, not a stale copy.
+            if tok_path.exists() && !args.force && !args.rebuild {
                 log_msg(&format!("[bootstrap] tokenizer cached: {}", tok_path.display()));
             } else {
                 std::fs::create_dir_all(tok_path.parent().unwrap())?;
@@ -653,14 +674,14 @@ pub fn run_bootstrap(args: BootstrapArgs) -> Result<()> {
 
     // 3. Build + register ---------------------------------------------------
     log_msg(&format!("[bootstrap] building trigram model '{}' ...", model_name));
-    build_via_self(&resolved_tok, &corpus_path, &model_name, args.force)?;
+    build_via_self(&resolved_tok, &corpus_path, &model_name, args.force || args.rebuild)?;
 
     println!();
     log_msg(&format!("[bootstrap] done. Registered model '{}'.", model_name));
     if model_name == man.default_alias {
-        println!("\nNext:  tokenov generate --count 1000000 | head   # '{}' is the default model", model_name);
+        println!("\nNext:  tokenov generate --count 1M | head   # '{}' is the default model", model_name);
     } else {
-        println!("\nNext:  tokenov generate --model {} --count 1000000 | head", model_name);
+        println!("\nNext:  tokenov generate --model {} --count 1M | head", model_name);
     }
     Ok(())
 }
