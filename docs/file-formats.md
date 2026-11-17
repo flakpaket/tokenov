@@ -64,3 +64,8 @@ any BufWriter spillage past the last write), and continues appending. With
 deterministic stream and discards the first `emitted` items via this sidecar
 alone. Both files are removed automatically on clean completion.
 
+The default `--wordlist` generator keeps the byte offset in its checkpoint file
+instead, and writes this sidecar only with `--no-checkpoint` (with or without
+`--strict`). On `--resume` it truncates the output to `byte_offset`, reads the
+`emitted` lines back so it does not write them again, and re-runs.
+

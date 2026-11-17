@@ -5,6 +5,71 @@ All notable changes to tokenov are recorded here. Versions follow
 or model format, MINOR for new opt-in surface with unchanged default output,
 PATCH for fixes.
 
+## 1.4.0 — unreleased
+
+A better default for `--wordlist`. **`--wordlist` output changes; add
+`--append-only` to get exactly the output of earlier versions.** Output without
+`--wordlist`, and `score`, `model`, `tokenizer` and `bootstrap`, are unchanged
+from 1.3.0.
+
+### Changed
+
+- **`--wordlist` places each word anywhere in the candidate** ("Anywhere"). The
+  model adds characters before the word, after it, or both (`ilovecisco`,
+  `#1cisco2024`, `cisco2024!`), and every candidate is ranked by how likely the
+  model finds the whole password, across all words, in one pass. Until now the
+  word always started the candidate. Details:
+  - the characters in front of a word are chosen for how well they lead into
+    it, and may run into the word the way the tokenizer splits it
+    (`il` + `ove`);
+  - a step inside a word that the model has no statistics for is priced from
+    how common the token is overall, so far fewer words in a list are skipped;
+  - every output line is unique, and `--count` is exact;
+  - every `generate` flag works, including `--strict`, `--threads`,
+    `--case-shape`, `--enterprise`, `--unigram-tail`, checkpoints and
+    `--resume` (a resumed run writes no line twice, and a `--strict` run
+    continues byte for byte);
+  - tokenov keeps a record of every line it has printed, about 16 bytes per
+    candidate, so give long runs a `--count`;
+  - with `--min-level`, about 1% of lines can repeat ones a full run printed
+    below that level.
+
+  In our tests on leaked passwords of staff at nine large companies, with a
+  wordlist scraped from each company's website, on the passwords left after
+  running that wordlist through hashcat's dive rules, it cracked about 65% more
+  than the previous `--wordlist` at 100 million candidates, and more at every
+  company. See [docs/wordlist.md](docs/wordlist.md).
+- **`--append-only`** now selects the previous `--wordlist` generator. Its output
+  is byte-identical to 1.3.0's `--wordlist` (and `--append-only`).
+- **`--prepend-only`** now runs the new generator with the word at the end of
+  the candidate. It used to run the separate fixed-additions generator behind
+  `--float`, which is gone.
+- **`--rare-first`** prints a warning that it will be deprecated in a future
+  release. Its output is unchanged.
+- **`--min-len` and `--max-len` count bytes everywhere.** The removed
+  fixed-additions generator counted characters.
+- Checkpoints from earlier versions do not resume in 1.4.0.
+
+### Retired
+
+These are still accepted, print a warning and run something else. See
+[docs/retired.md](docs/retired.md).
+
+- **`--float`** runs the new default (with `--rare-first` it is ignored).
+- **`--mode seeded`** runs `--append-only`, with the same output.
+  **`--mode weighted`** and **`--mode combined`** run the new default; the bias
+  they applied to the model is gone, and **`--bias`** has no effect.
+- **`--seed-mode`** is still honored by `--append-only` and ignored otherwise.
+
+### Fixed
+
+- `--lazy`, `--force-child-cache` and `--bounded-cap` print a warning when the
+  run cannot use them (the default `--wordlist` generator) instead of being
+  silently ignored.
+- A checkpoint or progress file no longer resumes a run with a different
+  `--case-shape` or `--enterprise` setting. Both change the output, and resuming
+  across them mixed two different streams in one file.
+
 ## 1.3.0 — 2026-11-15
 
 A second way to target a wordlist, and a fix for `--float` on large lists.

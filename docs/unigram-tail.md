@@ -118,8 +118,7 @@ Notes:
 
 ## Limitations
 
-`--wordlist` with `--float` or `--prepend-only` warns and ignores the flag: that
-generator joins words to a fixed set of additions instead of walking the model,
-so the tail has nothing to act on. `score` always uses the default weight, so
+With `--wordlist`, the tail applies to the characters the model adds around
+each word, not to how the word itself is priced. `score` always uses the default weight, so
 scores are not directly comparable to a stream generated with a non-default
 `FRACTION`.
