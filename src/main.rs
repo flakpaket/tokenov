@@ -663,7 +663,9 @@ struct GenerateArgs {
     /// full run: same candidates, same order, minus the skipped levels. Long
     /// candidates concentrate at higher levels, but the overlap is wide — this is
     /// a stream-volume knob, not a length filter; use it with --min-len. Run with
-    /// -v to see the level a run stopped at.
+    /// -v to see the level a run stopped at. With --wordlist (except
+    /// --append-only and --rare-first), about 1% of lines can repeat ones the
+    /// full run printed below level N; see docs/wordlist.md.
     #[arg(long, default_value_t = 0, value_name = "N", help_heading = "Generation")]
     min_level: u32,
 
@@ -689,6 +691,10 @@ struct GenerateArgs {
     /// and skips the first N already-written candidates via the `<output>.progress`
     /// sidecar. Args must match the original run; if nothing is resumable, run
     /// without `--resume`.
+    ///
+    /// With `--wordlist` (except `--append-only` and `--rare-first`), the run
+    /// re-generates the unfinished part of the level it was on and writes no
+    /// line twice; strict resume then works on stdout too. See docs/resume.md.
     #[arg(long, default_value_t = false, help_heading = "Resume & checkpointing")]
     resume: bool,
 

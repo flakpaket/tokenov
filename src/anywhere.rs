@@ -1581,12 +1581,21 @@ pub fn run(args: &GenerateArgs, inp: Inputs, entry_seqs: &[Vec<u32>], opts: Opts
     let rt = Rt::new(Box::new(SinkW(sink)), target, args.flush_bytes);
     if let Some((lines, bytes)) = have {
         let t = Instant::now();
-        match (&args.output, &rc.checkpoint_to) {
+        match (&args.output, &rc.resume_from) {
             (Some(out), _) => restore_from_output(&rt, out, lines, bytes)?,
-            (None, Some(cp)) => restore_from_log(&rt, &seen_log_path(cp), lines).with_context(||
-                "the run being resumed wrote to --output FILE? Resume it with the same --output")?,
-            (None, None) => bail!("--resume: candidates already written to stdout cannot be recovered \
-                                   without a checkpoint"),
+            (None, Some(rf)) => {
+                let from = seen_log_path(rf);
+                restore_from_log(&rt, &from, lines).with_context(||
+                    "if the run being resumed wrote to --output FILE, resume it with the same --output")?;
+                // Writing to another checkpoint: carry the hashes over.
+                if let Some(cp) = &rc.checkpoint_to {
+                    let to = seen_log_path(cp);
+                    if to != from {
+                        std::fs::copy(&from, &to).with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
+                    }
+                }
+            }
+            (None, None) => bail!("--resume requires --output FILE (no sidecar exists for stdout)"),
         }
         rt.emitted.store(lines, AO::Relaxed);
         let mut o = rt.out.lock().unwrap();
@@ -2035,6 +2044,52 @@ mod tests {
         assert!(buf.lock().unwrap().is_empty());
         let bad = Pos { level: 0, units: n + 1, done: vec![false; n + 1], deferred: false };
         assert!(sweep(&p, &rt, 1, bad).is_err());
+    }
+
+    /// Apply `f` (None = drop) to each line of `plain`, keep first occurrences.
+    fn derive(plain: &[u8], f: &dyn Fn(&[u8]) -> Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut seen: FxHashSet<Vec<u8>> = FxHashSet::default();
+        let mut out = Vec::new();
+        for l in lines(plain) { for x in f(l) { if seen.insert(x.clone()) { out.push(x); } } }
+        out
+    }
+
+    fn take(v: &[u8]) -> Vec<Vec<u8>> { lines(v).into_iter().map(|l| l.to_vec()).collect() }
+
+    /// --enterprise, --case-shape and the length filters change only what a
+    /// candidate is written as: each run equals its transform applied to the
+    /// plain stream, deduplicated, in the same order.
+    #[test]
+    fn transforms_are_the_plain_stream_transformed() {
+        let em = synth_em(false);
+        let a: &dyn Variant = &crate::variant_a::A;
+        let plain = sweep_to_vec(&em, a, opts(false, false), 20_000, Pos::default(), &[]);
+        // --enterprise (min length 8 here, so long lines only).
+        let mut o = opts(false, false);
+        o.enterprise = true;
+        let got = take(&sweep_to_vec(&em, a, o, 40, Pos::default(), &[]));
+        let want = derive(&plain, &|l: &[u8]| match enterprise::decide(l) {
+            enterprise::Decision::AsIs => vec![l.to_vec()],
+            enterprise::Decision::Cap => { let mut x = l.to_vec(); x[0] = x[0].to_ascii_uppercase(); vec![x] }
+            enterprise::Decision::Drop => vec![],
+        });
+        assert_eq!(got.len(), 40);
+        assert_eq!(got[..], want[..40]);
+        // --case-shape "lower;upper": both forms of each candidate, in order
+        // (`lower` leaves a token as it is, as in the enumerator).
+        let mut o = opts(false, false);
+        o.case_masks = CaseMask::parse_spec("lower;upper").unwrap();
+        let got = take(&sweep_to_vec(&em, a, o, 300, Pos::default(), &[]));
+        let want = derive(&plain, &|l: &[u8]| vec![l.to_vec(), l.to_ascii_uppercase()]);
+        assert_eq!(got.len(), 300);
+        assert_eq!(got[..], want[..300]);
+        // --min-len / --max-len filter the same stream.
+        let mut o = opts(false, false);
+        o.min_len = 4; o.max_len = 6;
+        let got = take(&sweep_to_vec(&em, a, o, 300, Pos::default(), &[]));
+        let want = derive(&plain, &|l: &[u8]| if (4..=6).contains(&l.len()) { vec![l.to_vec()] } else { vec![] });
+        assert_eq!(got.len(), 300);
+        assert_eq!(got[..], want[..300]);
     }
 
     /// --case-shape: each pattern re-cases by token position over the whole
