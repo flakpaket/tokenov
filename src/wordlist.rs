@@ -1234,6 +1234,7 @@ where
                         target_level: 0, init_idx: 0, prefix: Vec::new(), idx_stack: Vec::new(),
                         emitted: total,
                         streams: streams.iter().map(Stream::snapshot).collect(),
+                        wordlist_pos: String::new(),
                     });
                     last_ckpt = Instant::now();
                 }

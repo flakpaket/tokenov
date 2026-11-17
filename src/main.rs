@@ -43,8 +43,8 @@ mod case_mask;
 mod enterprise;
 mod registry;
 mod bootstrap;
-mod graft;
 mod wordlist;
+mod anywhere;
 mod recover;
 
 use case_mask::{apply_op, CaseMask};
@@ -517,8 +517,14 @@ fn parse_count(s: &str) -> Result<u64, String> {
 #[derive(clap::Args, Debug, Clone, Default)]
 struct GenerateArgs {
     /// Path to a target word list, one entry per line. Without this flag
-    /// tokenov runs in standard mode, using only the model. See --append-only,
-    /// --float and --rare-first for the ways a list is used.
+    /// tokenov runs in standard mode, using only the model.
+    ///
+    /// Each word is placed anywhere in the candidate: the model adds characters
+    /// before it, after it, or both (`ilovecisco`, `cisco2024!`, `#1cisco`), and
+    /// candidates come out likeliest first across all words, priced as the model
+    /// prices any password. Output lines are unique. --append-only and
+    /// --prepend-only keep the additions to one side; --rare-first is an
+    /// alternative generator. See docs/wordlist.md.
     #[arg(long, help_heading = "Generation")]
     wordlist: Option<PathBuf>,
 
@@ -528,43 +534,33 @@ struct GenerateArgs {
     #[arg(long, help_heading = "Generation")]
     model: Option<PathBuf>,
 
-    /// Add characters after each word only (`cisco2024`). The default.
+    /// Each word starts the candidate; the model adds characters after it only
+    /// (`cisco2024`).
     ///
-    /// This is what --wordlist does without other flags, so passing it changes
-    /// nothing. Each word starts the candidate and the model adds characters
-    /// after it; candidates come out likeliest first across all words. Every
-    /// `generate` flag works (--strict, --threads, --resume, --max-tokens,
-    /// --min-level, --unigram-tail). With --rare-first: keeps the added
+    /// This is how --wordlist worked before tokenov 1.4.0, and gives the same
+    /// output as 1.3.0's --wordlist. With --rare-first: keeps the added
     /// characters after the word.
     ///
-    /// Only one of --append-only, --prepend-only and --float can be given.
+    /// Only one of --append-only and --prepend-only can be given.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     append_only: bool,
 
-    /// Add characters before each word only (`ilovecisco`).
+    /// Each word ends the candidate; the model adds characters before it only
+    /// (`ilovecisco`, `2024cisco`).
     ///
-    /// Uses the same generator as --float, before the word only. With
-    /// --rare-first: keeps the added characters before the word.
+    /// The default generator with nothing after the word. With --rare-first:
+    /// keeps the added characters before the word.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     prepend_only: bool,
 
-    /// Add characters on either side of each word, rarest words first.
-    ///
-    /// A separate, simpler generator. Each word's share of --count is
-    /// proportional to how rare the model finds it, and the rarest word comes
-    /// first. The additions come from a fixed set: the most common password
-    /// starts and tokens, plus the other words in your list. Compound words also
-    /// contribute their parts (`johnsmith` -> `john`, `smith`). --count,
-    /// --min-len, --max-len, --min-tokens, --case-shape and --enterprise work.
-    /// It is single-threaded and keeps no checkpoint: --min-level is an error,
-    /// and --strict, --threads, --max-tokens, --unigram-tail, --resume,
-    /// --resume-state and --checkpoint-file print a warning and are ignored.
-    /// With --rare-first: additions on either side, which --rare-first already
-    /// does by default.
-    #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
+    /// Retired: prints a warning and runs the default --wordlist generator,
+    /// which also adds characters on either side of each word. See
+    /// docs/retired.md.
+    #[arg(long, default_value_t = false, hide = true)]
     float: bool,
 
     /// Give the rarest words the most candidates, with model-generated additions.
+    /// To be deprecated in a future release (prints a warning).
     ///
     /// An alternative to the default --wordlist generator. Each word's share of
     /// the output is proportional to how rare the model finds it (see
@@ -574,9 +570,9 @@ struct GenerateArgs {
     /// their parts (`johnsmith` -> `john`, `smith`; see --no-split). Every
     /// `generate` flag works.
     ///
-    /// The default usually cracks more overall, because common words followed
-    /// by a number or symbol are still common passwords. --rare-first spends
-    /// more of the budget on the unusual, target-specific words.
+    /// The default cracked more in testing, because common words with a number
+    /// or symbol added are still common passwords. --rare-first spends more of
+    /// the budget on the unusual, target-specific words.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     rare_first: bool,
 
@@ -604,21 +600,20 @@ struct GenerateArgs {
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     no_split: bool,
 
-    /// LEGACY targeting mode (weighted|seeded|combined). Rarely needed; the
-    /// default, --float and --rare-first generators supersede it.
+    /// Retired (prints a warning). `seeded` runs --append-only; `weighted` and
+    /// `combined` run the default --wordlist generator. See docs/retired.md.
     #[arg(long, value_enum, hide = true)]
     mode: Option<Mode>,
 
-    /// Strength of word-list influence (legacy weighted/combined modes only).
-    /// Higher tilts harder toward word-list tokens; 1.0 is a no-op. Must be > 0.
-    #[arg(long, default_value_t = 2.0, hide = true)]
-    bias: f32,
+    /// Retired: no effect (prints a warning). See docs/retired.md.
+    #[arg(long, hide = true)]
+    bias: Option<f32>,
 
-    /// How seeds are derived in the legacy seeded / combined modes.
-    ///   entry  — one seed per word-list entry (default; targets entries)
-    ///   token  — one seed per unique token from the union of tokenizations
-    #[arg(long, value_enum, default_value_t = SeedMode::Entry, hide = true)]
-    seed_mode: SeedMode,
+    /// Retired (prints a warning). Still honored by --append-only, where
+    /// `token` starts candidates with each distinct token of the list instead
+    /// of each word; ignored otherwise. See docs/retired.md.
+    #[arg(long, value_enum, hide = true)]
+    seed_mode: Option<SeedMode>,
 
     /// [DEPRECATED — no-op] Wordlist expansion was retired. Expand your seed list
     /// with separate tooling and pass the result to --wordlist. Accepted but
@@ -639,13 +634,11 @@ struct GenerateArgs {
     #[arg(short = 'c', long, value_name = "N", value_parser = parse_count, help_heading = "Generation")]
     count: Option<u64>,
 
-    /// Minimum candidate length in bytes (characters under --float /
-    /// --prepend-only). 0 disables.
+    /// Minimum candidate length in bytes. 0 disables.
     #[arg(long, default_value_t = 4, value_name = "N", help_heading = "Generation")]
     min_len: usize,
 
-    /// Maximum candidate length in bytes (characters under --float /
-    /// --prepend-only). 256 or more effectively disables it.
+    /// Maximum candidate length in bytes. 256 or more effectively disables it.
     #[arg(long, default_value_t = 30, value_name = "N", help_heading = "Generation")]
     max_len: usize,
 
@@ -670,7 +663,9 @@ struct GenerateArgs {
     /// full run: same candidates, same order, minus the skipped levels. Long
     /// candidates concentrate at higher levels, but the overlap is wide — this is
     /// a stream-volume knob, not a length filter; use it with --min-len. Run with
-    /// -v to see the level a run stopped at.
+    /// -v to see the level a run stopped at. With --wordlist (except
+    /// --append-only and --rare-first), about 1% of lines can repeat ones the
+    /// full run printed below level N; see docs/wordlist.md.
     #[arg(long, default_value_t = 0, value_name = "N", help_heading = "Generation")]
     min_level: u32,
 
@@ -696,6 +691,10 @@ struct GenerateArgs {
     /// and skips the first N already-written candidates via the `<output>.progress`
     /// sidecar. Args must match the original run; if nothing is resumable, run
     /// without `--resume`.
+    ///
+    /// With `--wordlist` (except `--append-only` and `--rare-first`), the run
+    /// re-generates the unfinished part of the level it was on and writes no
+    /// line twice; strict resume then works on stdout too. See docs/resume.md.
     #[arg(long, default_value_t = false, help_heading = "Resume & checkpointing")]
     resume: bool,
 
@@ -2220,446 +2219,6 @@ fn confirm(prompt: &str) -> Result<bool> {
 // `tokenov generate` — emit candidates, with optional wordlist targeting
 // ============================================================================
 
-// ============================================================================
-// Skipgram-style wordlist expansion via bigram-distribution cosine similarity.
-//
-// Two tokens s, t are "similar" if their KN-continuation distributions
-// P_cont(* | s) and P_cont(* | t) are similar in shape (cosine over the sparse
-// per-token bigram entries). Tokens that follow similar things are similar in
-// behavior; in password contexts this captures structural variants (e.g.
-// 'password' ↔ 'passwd' both followed by digits, suffixes, END at similar
-// rates).
-//
-// Expansion: for each token in the wordlist, find the top-K most-similar
-// tokens by cosine similarity over their bigram-cont distributions, and add
-// those to the W set used by weighted/combined bias. Implementation is sparse:
-// per-token vectors live as (id, prob) pairs from the model's bigram_kn map;
-// dot products use sparse intersection (both sides sorted by id, merge walk).
-//
-// Cost: O(|W_explicit| × n_bigram_contexts × avg_children) for the sweep.
-// For 100-token wordlist + 30K bigram-contexts + 50 avg children: ~150M ops,
-// ~150ms wall clock.
-// ============================================================================
-
-fn rebuild_per_token_probs(model: &Model) -> FxHashMap<u32, Vec<(u32, f32)>> {
-    // Forward direction: for each token b (the "second token" / preceding
-    // token), the vector is its P_cont(t | b) distribution over t.
-    //
-    // Convert each bigram_kn cumdist back to per-child raw probability so we
-    // can compute dot products cleanly.
-    let mut out: FxHashMap<u32, Vec<(u32, f32)>> = FxHashMap::default();
-    out.reserve(model.bigram_kn.len());
-    for (&b, (ids, cum)) in &model.bigram_kn {
-        let mut entries: Vec<(u32, f32)> = Vec::with_capacity(ids.len());
-        let mut prev: f32 = 0.0;
-        for (i, &id) in ids.iter().enumerate() {
-            let p = cum[i] - prev;
-            prev = cum[i];
-            entries.push((id, p));
-        }
-        // Already sorted by id (build pass sorts before serializing).
-        out.insert(b, entries);
-    }
-    out
-}
-
-/// Inverse direction: for each token t (the "third token" / current token),
-/// the vector is the distribution of P_cont(t | b) values across all b that
-/// have t in their forward distribution. Tokens t1, t2 are "inverse-similar"
-/// if they appear in the continuation distributions of similar b's with
-/// similar weights — captures preceding-context similarity (prefix-role).
-///
-/// The sparse cosine of these vectors works the same as the forward direction;
-/// the values aren't strictly P(b | t) but the cosine just needs comparable
-/// vectors and the cosine-similarity scale is the same shape.
-fn rebuild_per_token_probs_inverse(model: &Model) -> FxHashMap<u32, Vec<(u32, f32)>> {
-    let mut out: FxHashMap<u32, Vec<(u32, f32)>> = FxHashMap::default();
-    for (&b, (ids, cum)) in &model.bigram_kn {
-        let mut prev: f32 = 0.0;
-        for (i, &t) in ids.iter().enumerate() {
-            let p = cum[i] - prev;
-            prev = cum[i];
-            out.entry(t).or_default().push((b, p));
-        }
-    }
-    // sparse_cosine requires entries sorted by id (the b values here).
-    for v in out.values_mut() {
-        v.sort_by_key(|x| x.0);
-    }
-    out
-}
-
-fn precompute_bigram_norms(per_token: &FxHashMap<u32, Vec<(u32, f32)>>) -> FxHashMap<u32, f32> {
-    let mut out: FxHashMap<u32, f32> = FxHashMap::default();
-    out.reserve(per_token.len());
-    for (&b, entries) in per_token {
-        let s: f64 = entries.iter().map(|(_, p)| (*p as f64) * (*p as f64)).sum();
-        out.insert(b, s.sqrt() as f32);
-    }
-    out
-}
-
-/// Sparse cosine over two id-sorted (id, prob) lists. Linear in their combined
-/// length via merge walk.
-fn sparse_cosine(
-    a_entries: &[(u32, f32)], a_norm: f32,
-    b_entries: &[(u32, f32)], b_norm: f32,
-) -> f32 {
-    if a_norm == 0.0 || b_norm == 0.0 { return 0.0; }
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut dot: f64 = 0.0;
-    while i < a_entries.len() && j < b_entries.len() {
-        let (ai, ap) = a_entries[i];
-        let (bi, bp) = b_entries[j];
-        if ai == bi {
-            dot += (ap as f64) * (bp as f64);
-            i += 1; j += 1;
-        } else if ai < bi {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    (dot / (a_norm as f64 * b_norm as f64)) as f32
-}
-
-/// Inner sweep: for each w in `wordlist_tokens`, find the top-K most-similar
-/// tokens by cosine over `per_token[*]` and add them to `out`. Returns
-/// (n_added, n_not_found).
-fn skipgram_sweep(
-    per_token: &FxHashMap<u32, Vec<(u32, f32)>>,
-    norms: &FxHashMap<u32, f32>,
-    wordlist_tokens: &[u32],
-    top_k: usize,
-    out: &mut FxHashMap<u32, ()>,
-) -> (usize, usize) {
-    let mut not_found = 0usize;
-    let mut summed_added = 0usize;
-    for &w in wordlist_tokens {
-        let w_entries = match per_token.get(&w) {
-            Some(v) => v,
-            None => { not_found += 1; continue; }
-        };
-        let w_norm = norms[&w];
-        let mut topk: Vec<(f32, u32)> = Vec::with_capacity(top_k + 1);
-        for (&t, t_entries) in per_token {
-            if t == w { continue; }
-            let t_norm = norms[&t];
-            let sim = sparse_cosine(w_entries, w_norm, t_entries, t_norm);
-            if topk.len() < top_k {
-                topk.push((sim, t));
-                if topk.len() == top_k {
-                    topk.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-                }
-            } else if sim > topk[0].0 {
-                topk[0] = (sim, t);
-                topk.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-            }
-        }
-        for (_sim, t) in topk {
-            if !out.contains_key(&t) {
-                out.insert(t, ());
-                summed_added += 1;
-            }
-        }
-    }
-    (summed_added, not_found)
-}
-
-/// Return W_expanded as a set: W_explicit ∪ { top-K most-similar tokens to
-/// each w in W_explicit by bigram-distribution cosine }. Skips wordlist tokens
-/// that have no bigram entry (no contexts seen in training; rare).
-///
-/// Direction:
-///   - Forward: similarity over P(t | w) — "what comes after w". Captures
-///     suffix-role similarity (e.g., common base words followed by digit
-///     suffixes).
-///   - Inverse: similarity over P(b | w) — "what comes before w". Captures
-///     prefix-role similarity (e.g., named-entity / brand tokens occupying
-///     the same starting positions).
-///   - Both: union of top-K from each direction.
-fn expand_via_skipgram(
-    model: &Model,
-    wordlist_tokens: &[u32],
-    top_k: usize,
-    direction: SkipgramDirection,
-) -> Vec<u32> {
-    if top_k == 0 || !model.is_kn {
-        return wordlist_tokens.to_vec();
-    }
-
-    let mut out: FxHashMap<u32, ()> = FxHashMap::default();
-    for &w in wordlist_tokens { out.insert(w, ()); }
-
-    let do_fwd = matches!(direction, SkipgramDirection::Forward | SkipgramDirection::Both);
-    let do_inv = matches!(direction, SkipgramDirection::Inverse | SkipgramDirection::Both);
-
-    let mut total_added = 0usize;
-
-    if do_fwd {
-        let t0 = Instant::now();
-        let per_token = rebuild_per_token_probs(model);
-        let norms = precompute_bigram_norms(&per_token);
-        log_msg(&format!(
-            "[skipgram] forward index: {} bigram contexts in {:.1}s",
-            norms.len(), t0.elapsed().as_secs_f64()));
-        let t1 = Instant::now();
-        let (added, not_found) = skipgram_sweep(&per_token, &norms, wordlist_tokens, top_k, &mut out);
-        total_added += added;
-        log_msg(&format!(
-            "[skipgram] forward sweep: +{} tokens (top_k={}, {} skipped no-fwd-entry) in {:.1}s",
-            added, top_k, not_found, t1.elapsed().as_secs_f64()));
-    }
-
-    if do_inv {
-        let t0 = Instant::now();
-        let per_token_inv = rebuild_per_token_probs_inverse(model);
-        let norms_inv = precompute_bigram_norms(&per_token_inv);
-        log_msg(&format!(
-            "[skipgram] inverse index: {} tokens with precursors in {:.1}s",
-            norms_inv.len(), t0.elapsed().as_secs_f64()));
-        let t1 = Instant::now();
-        let (added, not_found) = skipgram_sweep(&per_token_inv, &norms_inv, wordlist_tokens, top_k, &mut out);
-        total_added += added;
-        log_msg(&format!(
-            "[skipgram] inverse sweep: +{} tokens (top_k={}, {} skipped no-inv-entry) in {:.1}s",
-            added, top_k, not_found, t1.elapsed().as_secs_f64()));
-    }
-
-    log_msg(&format!(
-        "[skipgram] direction={:?}, expanded {} explicit tokens by {} new total",
-        direction, wordlist_tokens.len(), total_added));
-
-    // Debug: print the expanded set (decoded) up to a cap, so the user can
-    // verify which tokens were brought in. Suppressed when TOKENOV_QUIET=1.
-    if std::env::var("TOKENOV_QUIET").is_err() {
-        let mut all: Vec<u32> = out.keys().copied().collect();
-        all.sort_unstable();
-        let cap = 50usize;
-        let preview: Vec<String> = all.iter().take(cap).map(|&id| {
-            if (id as usize) < model.decode.len() {
-                String::from_utf8_lossy(&model.decode[id as usize]).into_owned()
-            } else {
-                format!("<id={}>", id)
-            }
-        }).collect();
-        log_msg(&format!(
-            "[skipgram] expanded W (first {} of {}): {:?}",
-            preview.len(), all.len(), preview));
-    }
-
-    out.keys().copied().collect()
-}
-
-/// Apply per-context multiplicative bias to a cum-distribution model (Scheme A).
-/// **Use only on V1 (unsmoothed) models.** For V2/KN models, use
-/// `apply_weighted_bias_kn_aware` instead — this function operates on the
-/// trigram tier alone, which over-amplifies trigram mass in KN models where
-/// trigram sums to (1 - lambda) and the bigram-backoff tier carries lambda
-/// worth of mass (left untouched here, leading to per-context emission >1).
-///
-/// Per-context renormalization preserves distribution-summing-to-1.
-fn apply_weighted_bias(
-    model: &Model,
-    w_set: &FxHashMap<u32, ()>,
-    bias: f32,
-) -> FxHashMap<Ctx, (Vec<u32>, Vec<f32>)> {
-    let mut out: FxHashMap<Ctx, (Vec<u32>, Vec<f32>)> = FxHashMap::default();
-    out.reserve(model.contexts.len());
-    for (&ctx, (ids, cum)) in &model.contexts {
-        // Rebuild raw probs from cumdist
-        let n = ids.len();
-        let mut raw = Vec::with_capacity(n);
-        let mut prev = 0.0_f32;
-        for i in 0..n {
-            raw.push(cum[i] - prev);
-            prev = cum[i];
-        }
-        // Bias multiply
-        for (i, &id) in ids.iter().enumerate() {
-            if w_set.contains_key(&id) {
-                raw[i] *= bias;
-            }
-        }
-        // Renormalize (per context)
-        let total: f32 = raw.iter().sum();
-        if total <= 0.0 { continue; }
-        let inv = 1.0_f32 / total;
-        let mut new_cum = Vec::with_capacity(n);
-        let mut acc = 0.0_f32;
-        for r in &raw {
-            acc += r * inv;
-            new_cum.push(acc);
-        }
-        if let Some(last) = new_cum.last_mut() { *last = 1.0_f32; }
-        out.insert(ctx, (ids.clone(), new_cum));
-    }
-    out
-}
-
-/// KN-aware multiplicative bias (Scheme A, joint-distribution variant).
-///
-/// For V2/KN models, the trigram tier sums to `(1 - lambda)` per context, with
-/// the remaining `lambda` worth of mass flowing through the bigram-backoff
-/// tier. Biasing the trigram tier alone (as `apply_weighted_bias` does) yields
-/// per-context emission probabilities that sum to >1 because the bigram tier
-/// is unmodified — the model is no longer a proper distribution.
-///
-/// This function instead computes the **joint emission distribution** per
-/// context (the deduped union of trigram entries with weight `P_tri(t)` and
-/// bigram-backoff entries with weight `λ × P_cont(t)`), applies the bias to
-/// W-tokens in that joint table, and renormalizes the whole context to sum
-/// to 1. Output is a single-tier per-context distribution.
-///
-/// Bigram-only contexts (where `(a,b)` has no trigram entry but `b` has bigram
-/// entries) are handled by the second return value: a globally pre-biased
-/// `bigram_kn` keyed on `b` with `bias_factor[t]` applied per token then
-/// renormalized per b. The caller wires this into `post_bias_model.bigram_kn`
-/// and sets `lambda` to empty so the enumerator's bigram-fallback path emits
-/// these entries with `log_lam = 0` (full-backoff weight).
-///
-/// For V1 (non-KN) models this function falls back to the trigram-only
-/// behavior (which is correct in that regime) — see `apply_weighted_bias`.
-fn apply_weighted_bias_kn_aware(
-    model: &Model,
-    w_set: &FxHashMap<u32, ()>,
-    bias: f32,
-) -> (FxHashMap<Ctx, (Vec<u32>, Vec<f32>)>,
-      FxHashMap<u32, (Vec<u32>, Vec<f32>)>) {
-    if !model.is_kn {
-        // V1 path: bigram tier doesn't exist, trigram-only bias is correct.
-        let contexts = apply_weighted_bias(model, w_set, bias);
-        return (contexts, FxHashMap::default());
-    }
-
-    // V2/KN: build per-context joint emission, bias, renormalize.
-    //
-    // Pre-decompose bigram_kn[b] into (ids, raw_probs) for fast lookup. This
-    // dictionary is read-only during the per-context parallel sweep.
-    let mut bigram_raw: FxHashMap<u32, Vec<(u32, f32)>> = FxHashMap::default();
-    bigram_raw.reserve(model.bigram_kn.len());
-    for (&b, (ids, cum)) in &model.bigram_kn {
-        let mut entries = Vec::with_capacity(ids.len());
-        let mut prev = 0.0_f32;
-        for (i, &id) in ids.iter().enumerate() {
-            let p = cum[i] - prev;
-            prev = cum[i];
-            entries.push((id, p));
-        }
-        bigram_raw.insert(b, entries);
-    }
-
-    // Parallel per-context biasing. Each context is independent; collect into
-    // a Vec<(Ctx, ...)> then assemble the output FxHashMap. Using `par_iter`
-    // on `model.contexts` requires it to be a HashMap of materialized entries,
-    // which it is.
-    //
-    // Note: `tri_seen` membership check uses linear scan over a small Vec
-    // rather than a HashMap. Per-context entry count is typically <100; linear
-    // scan beats HashMap allocation overhead × millions of contexts.
-    let entries: Vec<(Ctx, (Vec<u32>, Vec<f32>))> = model.contexts
-        .par_iter()
-        .filter_map(|(&ctx, (tri_ids, tri_cum))| {
-            // ctx = pack(a, b) = (a << 32) | b — extract b (low 32 bits).
-            let b = (ctx & 0xFFFF_FFFFu64) as u32;
-            let lam = model.lambda.get(&ctx).copied().unwrap_or(0.0);
-
-            // Build joint = trigram entries + λ * bigram \ trigram.
-            let mut joint: Vec<(u32, f32)> = Vec::with_capacity(
-                tri_ids.len() + MAX_KN_BIGRAM_CHILDREN);
-            let mut prev = 0.0_f32;
-            for (i, &id) in tri_ids.iter().enumerate() {
-                let p = tri_cum[i] - prev;
-                prev = tri_cum[i];
-                joint.push((id, p));
-            }
-            // tri_seen as a sorted view over the trigram ids (already sorted
-            // by id at build time), used via binary search.
-            let tri_seen_n = tri_ids.len();
-            if let Some(bi_entries) = bigram_raw.get(&b) {
-                for &(id, q) in bi_entries.iter().take(MAX_KN_BIGRAM_CHILDREN) {
-                    // tri_ids is sorted ascending by id (build-time invariant);
-                    // binary_search is O(log n) per lookup vs O(n) for Vec.
-                    if tri_ids[..tri_seen_n].binary_search(&id).is_err() {
-                        joint.push((id, lam * q));
-                    }
-                }
-            }
-
-            // Apply bias to W-tokens.
-            for entry in joint.iter_mut() {
-                if w_set.contains_key(&entry.0) {
-                    entry.1 *= bias;
-                }
-            }
-
-            // Renormalize per context.
-            let total: f32 = joint.iter().map(|(_, p)| *p).sum();
-            if total <= 0.0 { return None; }
-            let inv = 1.0_f32 / total;
-
-            // Sort by id for deterministic ordering (not required by enumerator
-            // — prepare_enum_model re-sorts by log-prob — but keeps output
-            // stable).
-            joint.sort_unstable_by_key(|x| x.0);
-
-            let mut ids = Vec::with_capacity(joint.len());
-            let mut cum = Vec::with_capacity(joint.len());
-            let mut acc = 0.0_f32;
-            for (id, p) in &joint {
-                acc += p * inv;
-                ids.push(*id);
-                cum.push(acc);
-            }
-            if let Some(last) = cum.last_mut() { *last = 1.0_f32; }
-            Some((ctx, (ids, cum)))
-        })
-        .collect();
-
-    let mut out_contexts: FxHashMap<Ctx, (Vec<u32>, Vec<f32>)> = FxHashMap::default();
-    out_contexts.reserve(entries.len());
-    for (ctx, e) in entries {
-        out_contexts.insert(ctx, e);
-    }
-
-    // Pre-biased bigram_kn for bigram-only contexts. Apply per-token bias and
-    // renormalize per b. The enumerator emits these for any context not in
-    // out_contexts (i.e. bigram-only) via the bigram-fallback code path with
-    // log_lam = 0 (lambda unset).
-    let bigram_entries: Vec<(u32, (Vec<u32>, Vec<f32>))> = model.bigram_kn
-        .par_iter()
-        .filter_map(|(&b, (ids, cum))| {
-            let mut raw = Vec::with_capacity(ids.len());
-            let mut prev = 0.0_f32;
-            for (i, &id) in ids.iter().enumerate() {
-                let p = cum[i] - prev;
-                prev = cum[i];
-                let bias_factor = if w_set.contains_key(&id) { bias } else { 1.0 };
-                raw.push(p * bias_factor);
-            }
-            let total: f32 = raw.iter().sum();
-            if total <= 0.0 { return None; }
-            let inv = 1.0_f32 / total;
-            let mut new_cum = Vec::with_capacity(ids.len());
-            let mut acc = 0.0_f32;
-            for r in &raw {
-                acc += r * inv;
-                new_cum.push(acc);
-            }
-            if let Some(last) = new_cum.last_mut() { *last = 1.0_f32; }
-            Some((b, (ids.clone(), new_cum)))
-        })
-        .collect();
-    let mut out_bigram: FxHashMap<u32, (Vec<u32>, Vec<f32>)> = FxHashMap::default();
-    out_bigram.reserve(bigram_entries.len());
-    for (b, e) in bigram_entries {
-        out_bigram.insert(b, e);
-    }
-
-    (out_contexts, out_bigram)
-}
-
 // `EnumModel` and `prepare_enum_model` moved to `variant.rs` / `variant_a.rs`.
 // Each variant module owns its own `prepare` implementation, called via the
 // `Variant` trait at runtime. See `mod variant; mod variant_a;` near the top
@@ -3132,19 +2691,13 @@ fn resolve_unigram_tail(unigram_tail: Option<f32>, variant: &str) -> Result<(Str
     Ok((variant_name, unigram_logw))
 }
 
-/// `--min-level` is a floor on the enumerator's level sweep. Reject, rather than
-/// ignore, the two settings where it would silently do nothing: past `LEVEL_MAX`
-/// the sweep is empty and the run emits not one candidate, and the graft
-/// generator has no level sweep to floor at all.
-fn validate_min_level(min_level: u32, run_graft: bool, float: bool) -> Result<()> {
+/// `--min-level` is a floor on the level sweep. Reject, rather than ignore, a
+/// floor past `LEVEL_MAX`: the sweep would be empty and the run would emit not
+/// one candidate.
+fn validate_min_level(min_level: u32) -> Result<()> {
     if min_level > LEVEL_MAX {
         bail!("--min-level ({}) exceeds the maximum level {} — nothing would be emitted",
             min_level, LEVEL_MAX);
-    }
-    if min_level > 0 && run_graft {
-        bail!("--min-level has no effect with {} (that generator ranks seeds by \
-               surprisal instead of sweeping levels)",
-            if float { "--float" } else { "--prepend-only" });
     }
     Ok(())
 }
@@ -3186,48 +2739,130 @@ fn parse_case_masks(spec: &Option<String>) -> Result<Vec<CaseMask>> {
     }
 }
 
-/// Warn about, then clear, the `generate` flags that mean nothing to the graft
-/// generators (`--float` / `--prepend-only`).
-///
-/// Graft is not the level-sweep enumerator: it has no DFS to position, no worker
-/// threads to fan out, and no level sweep, so it writes no checkpoint and cannot
-/// resume. These flags used to be accepted and dropped without a word, so a run
-/// looked like it honored `--strict` or `--resume` when it had not. They now
-/// warn instead. They are not errors because old scripts must keep running (the
-/// retired-flag convention, cf. `--skipgram-expand`), and verified inert on
-/// 1.1.0, so ignoring them reproduces 1.1.0's output exactly. Each one is
-/// cleared after the warning so nothing downstream can act on it.
-/// (`--enterprise` and `--case-shape` ARE honored by graft, so they are absent
-/// from this list; `--min-level` stays an error, as it was in 1.1.0.)
-fn ignore_graft_flags(args: &mut GenerateArgs, run_graft: bool) {
-    if !run_graft { return; }
-    let flag = if args.float { "--float" } else { "--prepend-only" };
+/// Which generator a run uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordlistGen {
+    /// No --wordlist: standard generation.
+    None,
+    /// The default: each word anywhere in the candidate (anywhere.rs);
+    /// `at_end` = --prepend-only, the word ends the candidate.
+    Anywhere { at_end: bool },
+    /// --append-only (and the retired --mode seeded): the seeded enumerator,
+    /// the --wordlist generator of 1.3.0 and earlier.
+    Seeded,
+    /// --rare-first (wordlist.rs), on the side the side flags name.
+    RareFirst,
+}
+
+/// The generator `args` select. Call after `retire_wordlist_flags`.
+fn wordlist_gen(args: &GenerateArgs) -> WordlistGen {
+    if args.wordlist.is_none() { return WordlistGen::None; }
+    if args.rare_first { return WordlistGen::RareFirst; }
+    if args.append_only || args.mode == Some(Mode::Seeded) { return WordlistGen::Seeded; }
+    WordlistGen::Anywhere { at_end: args.prepend_only }
+}
+
+/// Warn about the retired --wordlist flags and clear --float, the one that is
+/// ignored outright. They stay accepted so old scripts keep running:
+/// * `--float` runs the default generator (which also adds characters on both
+///   sides); with --rare-first it is ignored (that is already its default side).
+/// * `--mode seeded` is --append-only (the same seeded enumerator, same output);
+///   `--mode weighted|combined` run the default generator (the bias they applied
+///   is gone); `--bias` has no effect.
+/// * `--seed-mode` is still honored by --append-only, so its output stays the
+///   same as 1.3.0's, and ignored elsewhere.
+fn retire_wordlist_flags(args: &mut GenerateArgs) {
+    let wl = args.wordlist.is_some();
+    if args.float {
+        if wl && args.rare_first {
+            warn_msg("warning: --float is retired and ignored: --rare-first already adds characters \
+                      on either side of each word. See docs/retired.md.");
+        } else if wl {
+            warn_msg("warning: --float is retired: running the default --wordlist generator, which \
+                      also adds characters on either side of each word. See docs/retired.md.");
+        }
+        args.float = false;
+    }
+    if let Some(m) = args.mode {
+        let name = match m { Mode::Weighted => "weighted", Mode::Seeded => "seeded", Mode::Combined => "combined" };
+        let what = if !wl { "has no effect without --wordlist (ignored)" }
+            else if m == Mode::Seeded { "is retired: it is the same as --append-only, which runs instead" }
+            else if args.append_only { "is retired and ignored: running --append-only" }
+            else { "is retired: running the default --wordlist generator instead" };
+        warn_msg(&format!("warning: --mode {name} {what}. See docs/retired.md."));
+    }
+    if args.bias.is_some() {
+        warn_msg("warning: --bias is retired and has no effect (ignored). See docs/retired.md.");
+    }
+    if args.seed_mode.is_some() {
+        if wordlist_gen(args) == WordlistGen::Seeded {
+            warn_msg("warning: --seed-mode is retired; --append-only still honors it in this release. \
+                      See docs/retired.md.");
+        } else {
+            warn_msg("warning: --seed-mode is retired and has no effect here (ignored). See docs/retired.md.");
+        }
+    }
+}
+
+/// Warn about, then clear, flags the default --wordlist generator cannot use
+/// and that would not change its output: it keeps its own memo of child lists
+/// instead of the enumerator's child cache.
+fn ignore_anywhere_flags(args: &mut GenerateArgs) {
     let mut bad: Vec<&str> = Vec::new();
-    if args.strict                    { bad.push("--strict");          args.strict = false; }
-    if args.threads.is_some()         { bad.push("--threads");         args.threads = None; }
-    if args.max_tokens != DEFAULT_MAX_TOKENS { bad.push("--max-tokens"); args.max_tokens = DEFAULT_MAX_TOKENS; }
-    if args.resume                    { bad.push("--resume");          args.resume = false; }
-    if args.resume_state.is_some()    { bad.push("--resume-state");    args.resume_state = None; }
-    if args.checkpoint_file.is_some() { bad.push("--checkpoint-file"); args.checkpoint_file = None; }
-    if args.unigram_tail.is_some()    { bad.push("--unigram-tail");    args.unigram_tail = None; }
+    if args.lazy_children          { bad.push("--lazy");              args.lazy_children = false; }
+    if args.force_child_cache      { bad.push("--force-child-cache"); args.force_child_cache = false; }
+    if args.bounded_cap.is_some()  { bad.push("--bounded-cap");       args.bounded_cap = None; }
     if bad.is_empty() { return; }
-    warn_msg(&format!("warning: {} {} no effect with {} and {} ignored (that generator \
-           ranks seeds by surprisal instead of sweeping levels: single-threaded, no DFS \
-           to checkpoint or resume, no per-path token cap). Drop {} to use the \
-           enumerator, which honors {}.",
-        bad.join(", "),
-        if bad.len() == 1 { "has" } else { "have" },
-        flag,
-        if bad.len() == 1 { "is" } else { "are" },
-        flag,
-        if bad.len() == 1 { "it" } else { "them" }));
+    warn_msg(&format!("warning: {} {} no effect with --wordlist (ignored); add --append-only to use {}.",
+        bad.join(", "), if bad.len() == 1 { "has" } else { "have" }, if bad.len() == 1 { "it" } else { "them" }));
+}
+
+/// Checkpoint and resume settings for the default --wordlist generator,
+/// resolved as `run_generate` resolves them for the enumerator. One difference:
+/// a run resumed from a checkpoint keeps writing to that checkpoint (unless
+/// --checkpoint-file names another), so its session record and hash log carry on.
+fn anywhere_resume_cfg(args: &GenerateArgs, model_path: &Path, n_threads: usize)
+                       -> Result<anywhere::ResumeCfg> {
+    if args.fast && args.strict {
+        bail!("--fast and --strict are mutually exclusive (fast is the default)");
+    }
+    let progress_path: Option<PathBuf> = args.output.as_ref().map(|p| {
+        let mut s = p.as_os_str().to_owned();
+        s.push(".progress");
+        PathBuf::from(s)
+    });
+    let args_fp = build_args_fingerprint(args, model_path, n_threads)?;
+    let explicit_resume: Option<PathBuf> = args.resume_state.clone();
+    let user_named_ckpt = args.checkpoint_file.is_some() || explicit_resume.is_some();
+    let run_id = new_run_id();
+    let ckpt_fp = format!("{} tokenov={}", args_fp, env!("CARGO_PKG_VERSION"));
+    let mut checkpoint_to: Option<PathBuf> = if args.no_checkpoint { None } else {
+        Some(args.checkpoint_file.clone()
+            .or_else(|| explicit_resume.clone())
+            .unwrap_or_else(|| default_checkpoint_path(&run_id)))
+    };
+    let resume_from: Option<PathBuf> = explicit_resume.clone()
+        .or_else(|| if !args.resume {
+            None
+        } else if args.checkpoint_file.is_some() {
+            checkpoint_to.clone()
+        } else {
+            find_resumable_checkpoint(&ckpt_fp)
+        });
+    if let (Some(rf), Some(_), None) = (&resume_from, &checkpoint_to, &args.checkpoint_file) {
+        checkpoint_to = Some(rf.clone());
+    }
+    let sidecar_resume = args.resume && resume_from.is_none();
+    let ckpt_is_default = checkpoint_to.is_some() && !user_named_ckpt;
+    Ok(anywhere::ResumeCfg { checkpoint_to, resume_from, sidecar_resume, ckpt_is_default,
+                             ckpt_fp, args_fp, progress_path, run_id, n_threads })
 }
 
 /// `--rare-first`: the side the rarity-first generator (wordlist.rs) runs on,
 /// or `None` when the run doesn't use it. Its tuning flags need it: without
-/// --rare-first a `--wordlist` run uses the seeded enumerator (bare /
-/// --append-only) or the graft generator (--float / --prepend-only), neither
-/// of which reads them. Call after the side flags are checked for exclusivity.
+/// --rare-first a `--wordlist` run uses the default generator or the seeded
+/// enumerator (--append-only), neither of which reads them. Call after the side
+/// flags are checked for exclusivity.
 fn wordlist_side(args: &GenerateArgs) -> Result<Option<wordlist::Side>> {
     if !args.rare_first {
         for (set, f) in [(args.mix, "--mix"), (args.no_split, "--no-split"),
@@ -3254,13 +2889,6 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // top-level spellings instead of erroring (issue-064 item 6).
     if args.sessions { return list_sessions(); }
     if let Some(id) = args.resume_session.clone() { return resume_session(&id); }
-    // Validate
-    if args.bias <= 0.0 {
-        bail!("--bias must be positive (got {})", args.bias);
-    }
-    if args.bias > 1000.0 {
-        warn_msg(&format!("warning: --bias={} is very large; numerical sensitivity in renorm", args.bias));
-    }
 
     // DEPRECATED: --skipgram-expand / --skipgram-direction. The old bigram-
     // continuation cosine-similarity expansion was retired — it captured
@@ -3288,19 +2916,16 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         bail!("--min-tokens ({}) cannot exceed --max-tokens ({})",
             args.min_tokens, args.max_tokens);
     }
-    // A --wordlist defaults to APPEND-ONLY (seed stays the prefix, affixes
-    // appended) — the seeded walk, routed through the seeded machinery, and
-    // --append-only is that default's explicit spelling (hence a no-op). The
-    // graft generator (rarity-weighted, affixes on either side) is opt-in via
-    // --float; --prepend-only is the prepend graft. --rare-first selects the
-    // rarity-first generator (wordlist.rs) instead, on the side the three flags
-    // name (default both). --mode is the legacy opt-in (weighted/seeded/combined).
+    // A --wordlist runs the default generator (anywhere.rs: each word anywhere
+    // in the candidate; --prepend-only = word last). --append-only runs the
+    // seeded enumerator, the --wordlist generator of 1.3.0 and earlier.
+    // --rare-first selects the rarity-first generator (wordlist.rs) instead, on
+    // the side the side flags name (default both). --float and --mode are
+    // retired (see retire_wordlist_flags).
     if [args.append_only, args.prepend_only, args.float].iter().filter(|&&x| x).count() > 1 {
         bail!("--append-only, --prepend-only, and --float are mutually exclusive");
     }
-    // The legacy --mode machinery and the graft generators are different code
-    // paths, and `run_graft` below requires `mode.is_none()`. Without this check
-    // `--float --mode seeded` silently discarded --float and ran the enumerator.
+    // Kept from 1.3.0, where these were different generators.
     if args.mode.is_some() && (args.prepend_only || args.float) {
         bail!("--mode (legacy) cannot be combined with {} — they select different \
                generators. Drop --mode to use {}, or drop {} to use --mode.",
@@ -3318,22 +2943,14 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                 named.join(", ")));
         }
     }
-    let run_graft = args.wordlist.is_some() && args.mode.is_none() && !args.rare_first
-        && (args.prepend_only || args.float);
-    validate_min_level(args.min_level, run_graft, args.float)?;
-    ignore_graft_flags(&mut args, run_graft);
-    // Concrete mode for the legacy machinery + the graft and rarity-first
-    // generators' unbiased model prep. None → Seeded (unbiased; --append-only
-    // is exactly seeded).
-    let legacy_mode: Mode = args.mode.unwrap_or(Mode::Seeded);
-
-    if args.wordlist.is_none() {
-        // Mode flag is meaningless without --wordlist. We still allow the
-        // default to pass through (so a bare `tokenov generate` works), but
-        // explicit non-default --mode without --wordlist is an error.
-        // (Default value can't be distinguished from explicit-default in
-        // clap derive; we treat any --mode without --wordlist as benign.)
+    retire_wordlist_flags(&mut args);
+    validate_min_level(args.min_level)?;
+    let wl_gen = wordlist_gen(&args);
+    if wl_gen == WordlistGen::RareFirst {
+        warn_msg("warning: --rare-first will be deprecated in a future release. The default \
+                  --wordlist generator (without --rare-first) cracked more in testing; use it instead.");
     }
+    if matches!(wl_gen, WordlistGen::Anywhere { .. }) { ignore_anywhere_flags(&mut args); }
 
     let (variant_name, unigram_logw) = resolve_unigram_tail(args.unigram_tail, &args.variant)?;
     let variant = variant::dispatch(&variant_name)?;
@@ -3360,37 +2977,24 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // both finalizers strip leading whitespace at minimum.
     let kind = guess_kind_from_decode(&model.decode);
 
-    // Phase 1: compute post-bias model + entry_seqs / w_set if wordlist.
-    //
-    // Standard-mode path (wordlist is None) is bit-identical to v1: we clone
-    // the loaded model and prepare_enum_model runs over the unmodified KN
-    // tiers. No bias / seed code is reachable.
-    //
-    // Wordlist-Some path: in addition to producing tokenized entries and the
-    // W set, we materialize a `post_bias_model` whose `contexts`, `bigram_kn`,
-    // and `lambda` reflect the bias (for weighted/combined) or are the
-    // unmodified original (for seeded). For KN models in weighted/combined,
-    // the bias is computed via `apply_weighted_bias_kn_aware` so the joint
-    // emission distribution per context is properly renormalized to sum to 1.
-    let (post_bias_model, entry_seqs_opt, _w_set, wl_tokenizer): (Model,
-                                                    Option<Vec<Vec<u32>>>,
-                                                    FxHashMap<u32, ()>, Option<Tokenizer>) = match args.wordlist.as_ref() {
-        None => {
-            // Standard mode — clone the loaded model unchanged. No bias.
-            let m = Model {
-                contexts: model.contexts.clone(),
-                decode: model.decode.clone(),
-                start_id: model.start_id,
-                end_id: model.end_id,
-                is_kn: model.is_kn,
-                discount: model.discount,
-                lambda: model.lambda.clone(),
-                bigram_kn: model.bigram_kn.clone(),
-                unigram_raw: model.unigram_raw.clone(),
-                unigram_kn_cont: model.unigram_kn_cont.clone(),
-            };
-            (m, None, FxHashMap::default(), None)
-        }
+    // Phase 1: the model copy `variant.prepare` reads, plus the tokenized
+    // wordlist. Every generator runs the model unchanged (the retired --mode
+    // weighted/combined bias is gone).
+    let post_bias_model = Model {
+        contexts: model.contexts.clone(),
+        decode: model.decode.clone(),
+        start_id: model.start_id,
+        end_id: model.end_id,
+        is_kn: model.is_kn,
+        discount: model.discount,
+        lambda: model.lambda.clone(),
+        bigram_kn: model.bigram_kn.clone(),
+        unigram_raw: model.unigram_raw.clone(),
+        unigram_kn_cont: model.unigram_kn_cont.clone(),
+    };
+    let (entry_seqs_opt, _w_set, wl_tokenizer): (Option<Vec<Vec<u32>>>, FxHashMap<u32, ()>,
+                                                 Option<Tokenizer>) = match args.wordlist.as_ref() {
+        None => (None, FxHashMap::default(), None),
         Some(p) => {
             let wordlist = read_wordlist(p)?;
             log_msg(&format!("[gen] wordlist: {} entries from {}", wordlist.len(), p.display()));
@@ -3411,92 +3015,10 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
                 for &id in seq { w_set.insert(id, ()); }
             }
             log_msg(&format!("[gen] wordlist token-set size: {}", w_set.len()));
-
-            // Optional skipgram-style expansion via bigram-distribution
-            // cosine similarity. Only the W set used for bias is expanded;
-            // seeds (in seeded/combined modes) remain the literal wordlist
-            // entries — see CLI flag docs for the rationale.
-            let w_set_for_bias: FxHashMap<u32, ()> = if args.skipgram_expand > 0 {
-                if !model.is_kn {
-                    bail!("--skipgram-expand requires a v2/KN model (NGRMv002); \
-                           the loaded model is v1. Rebuild via `tokenov model train`.");
-                }
-                let explicit: Vec<u32> = w_set.keys().copied().collect();
-                let expanded_ids = expand_via_skipgram(&model, &explicit,
-                    args.skipgram_expand, args.skipgram_direction);
-                let mut s: FxHashMap<u32, ()> = FxHashMap::default();
-                for id in expanded_ids { s.insert(id, ()); }
-                s
-            } else {
-                w_set.clone()
-            };
-            log_msg(&format!("[gen] wordlist token-set size for bias: {} (explicit={}, +expansion={})",
-                w_set_for_bias.len(),
-                w_set.len(),
-                w_set_for_bias.len().saturating_sub(w_set.len())));
-
-            // Build post-bias model. For weighted/combined under KN, the
-            // joint-distribution-aware bias collapses the trigram + bigram
-            // tiers into a per-context single-tier distribution and produces a
-            // pre-biased global bigram_kn for bigram-only contexts. Lambda is
-            // emptied so the enumerator's bigram-fallback path runs with
-            // log_lam = 0 (effective lambda = 1) for any context not in
-            // post-bias trigram. For seeded mode (no bias), the model is
-            // unchanged.
-            let m = match legacy_mode {
-                Mode::Weighted | Mode::Combined => {
-                    log_msg(&format!("[gen] applying KN-aware bias={} (mode={:?})", args.bias, legacy_mode));
-                    let (post_contexts, post_bigram) =
-                        apply_weighted_bias_kn_aware(&model, &w_set_for_bias, args.bias);
-                    Model {
-                        contexts: post_contexts,
-                        decode: model.decode.clone(),
-                        start_id: model.start_id,
-                        end_id: model.end_id,
-                        // Keep is_kn=true so bigram-only contexts use the
-                        // bigram-fallback path. Lambda is empty → log_lam=0.
-                        is_kn: model.is_kn,
-                        discount: model.discount,
-                        lambda: FxHashMap::default(),
-                        bigram_kn: post_bigram,
-                        unigram_raw: model.unigram_raw.clone(),
-                        unigram_kn_cont: model.unigram_kn_cont.clone(),
-                    }
-                }
-                // Seeded (and the graft and --rare-first generators) run the model
-                // unbiased.
-                Mode::Seeded => Model {
-                    contexts: model.contexts.clone(),
-                    decode: model.decode.clone(),
-                    start_id: model.start_id,
-                    end_id: model.end_id,
-                    is_kn: model.is_kn,
-                    discount: model.discount,
-                    lambda: model.lambda.clone(),
-                    bigram_kn: model.bigram_kn.clone(),
-                    unigram_raw: model.unigram_raw.clone(),
-                    unigram_kn_cont: model.unigram_kn_cont.clone(),
-                },
-            };
-            (m, Some(entry_seqs), w_set, Some(tokenizer))
+            (Some(entry_seqs), w_set, Some(tokenizer))
         }
     };
     let mut enum_model = variant.prepare(&post_bias_model, unigram_logw);
-
-    // Seed-chunk graft generator: OPT-IN via --float / --prepend-only. Bare
-    // --wordlist (and --append-only, its explicit spelling) does NOT come here —
-    // it runs the enumerator's seeded path below. A self-contained path that
-    // reads the model + wordlist and emits rarity-weighted combinations directly,
-    // bypassing the Markov enumerator. Branch here (before post_bias_model is
-    // dropped) so it can read the model's unigram/decode tiers.
-    if run_graft {
-        let graft_masks = parse_case_masks(&args.case_shape)?;
-        return match &entry_seqs_opt {
-            Some(entry_seqs) => graft::run(&args, &enum_model, &post_bias_model, entry_seqs,
-                &graft_masks),
-            None => unreachable!("run_graft implies wordlist present"),
-        };
-    }
 
     drop(post_bias_model);
 
@@ -3518,6 +3040,38 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         log_msg(&format!(
             "[gen] dropped model.contexts + bigram_kn + lambda ({} ctxs) — covered by enum_model",
             n_ctx_before));
+    }
+
+    // The default --wordlist generator (and --prepend-only): its own level sweep
+    // over (prefix, word, suffix), so it returns here, before the seeded /
+    // rare-first setup and the child cache (and before the trigram drop: it
+    // prices words with the raw tiers).
+    if let WordlistGen::Anywhere { at_end } = wl_gen {
+        drop(wl_tokenizer);
+        let n_threads = if args.strict {
+            if let Some(t) = args.threads {
+                if t > 1 {
+                    log_msg(&format!("[gen] --strict runs single-threaded (ignoring --threads {t})"));
+                }
+            }
+            1
+        } else {
+            args.threads.unwrap_or_else(rayon::current_num_threads).max(1)
+        };
+        let rc = anywhere_resume_cfg(&args, &model_path, n_threads)?;
+        let opts = anywhere::Opts {
+            max_tokens: args.max_tokens, min_tokens: args.min_tokens,
+            min_len: args.min_len, max_len: args.max_len,
+            enterprise: args.enterprise, case_masks: parse_case_masks(&args.case_shape)?,
+            word_at_end: at_end, word_unigram: Some(anywhere::WORD_UNIGRAM_F),
+            no_prune: std::env::var_os(anywhere::NO_PRUNE_ENV).is_some(),
+        };
+        let inp = anywhere::Inputs {
+            em: &enum_model, variant: &*variant, decode: &model.decode, kind,
+            start_id: model.start_id, end_id: model.end_id, unigram_raw: &model.unigram_raw,
+        };
+        let entry_seqs = entry_seqs_opt.as_ref().expect("--wordlist implies entries");
+        return anywhere::run(&args, inp, entry_seqs, opts, rc, &model_path);
     }
 
     // Phase 3: derive seeds from wordlist (if seeded/combined) using the
@@ -3548,10 +3102,10 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
         _ => None,
     };
     drop(wl_tokenizer);
-    let seeds: Vec<HeapEntry> = match (&entry_seqs_opt, legacy_mode, &wl_plan) {
+    let seeds: Vec<HeapEntry> = match (&entry_seqs_opt, wl_gen, &wl_plan) {
         (_, _, Some(plan)) => wordlist::initial_states(plan),
-        (Some(entry_seqs), Mode::Seeded, None) | (Some(entry_seqs), Mode::Combined, None) => {
-            build_seeds(&enum_model, entry_seqs, &_w_set, args.seed_mode,
+        (Some(entry_seqs), WordlistGen::Seeded, None) => {
+            build_seeds(&enum_model, entry_seqs, &_w_set, args.seed_mode.unwrap_or(SeedMode::Entry),
                 model.start_id, args.max_tokens)
         }
         _ => Vec::new(),
@@ -5284,8 +4838,11 @@ fn build_args_fingerprint(
     if let Some(f) = args.unigram_tail {
         write!(s, "unigram_tail={} ", f).unwrap();
     }
+    // The retired --bias / --seed-mode print their old defaults when unset, so
+    // fingerprints stay byte-identical to earlier releases.
     write!(s, "mode={:?} bias={} seed_mode={:?} prepend_only={} append_only={} float={} ",
-        args.mode, args.bias, args.seed_mode, args.prepend_only, args.append_only, args.float).unwrap();
+        args.mode, args.bias.unwrap_or(2.0), args.seed_mode.unwrap_or(SeedMode::Entry),
+        args.prepend_only, args.append_only, args.float).unwrap();
     write!(s, "skipgram_expand={} skipgram_direction={:?} ",
         args.skipgram_expand, args.skipgram_direction).unwrap();
     write!(s, "wordlist={:?}", args.wordlist).unwrap();
@@ -5303,6 +4860,19 @@ fn build_args_fingerprint(
         write!(s, " wordlist_gen=rare_first rarity_weight={} mix={} split={}",
             args.rarity_weight, args.mix, !args.no_split).unwrap();
     }
+    // The default --wordlist generator changed in 1.4.0: tag it, so a progress
+    // sidecar of an older --wordlist run (whose output is now --append-only's)
+    // never splices into it. The wordlist's size and mtime too: editing the
+    // list changes the stream.
+    if let WordlistGen::Anywhere { .. } = wordlist_gen(args) {
+        let (size, mtime) = args.wordlist.as_deref().and_then(|p| file_size_mtime(p).ok()).unwrap_or((0, 0));
+        write!(s, " wordlist_gen=anywhere wordlist_size={} wordlist_mtime={}", size, mtime).unwrap();
+    }
+    // These change the stream too; appended only when set, so other runs keep
+    // the fingerprint they had.
+    if let Some(cs) = &args.case_shape { write!(s, " case_shape={}", cs).unwrap(); }
+    if args.enterprise { write!(s, " enterprise=true").unwrap(); }
+    if args.variant != "baseline" && args.variant != "a" { write!(s, " variant={}", args.variant).unwrap(); }
     Ok(s)
 }
 
@@ -5408,6 +4978,9 @@ struct ThreadCkpt {
     /// Wordlist mode: one position per anchor stream (the single-position
     /// fields above are unused there). Empty for every other mode.
     streams:      Vec<wordlist::StreamCkpt>,
+    /// The default --wordlist generator: its sweep position (anywhere.rs,
+    /// `encode_pos`), with `target_level` the level. Empty for every other mode.
+    wordlist_pos: String,
 }
 
 /// Per-thread slot the writer serializes. `NotStarted` = worker hasn't published
@@ -5455,6 +5028,9 @@ fn write_checkpoint(path: &Path, fingerprint: &str, slots: &[CkptSlot]) -> Resul
                 for st in &c.streams {
                     writeln!(s, "stream={}", st.to_field()).unwrap();
                 }
+                if !c.wordlist_pos.is_empty() {
+                    writeln!(s, "wordlist_pos={}", c.wordlist_pos).unwrap();
+                }
             }
         }
     }
@@ -5484,8 +5060,9 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
     let mut sec_tl = 0u32; let mut sec_ii = 0usize; let mut sec_em = 0u64;
     let mut sec_prefix: Vec<u32> = vec![]; let mut sec_idx: Vec<usize> = vec![];
     let mut sec_streams: Vec<wordlist::StreamCkpt> = vec![];
+    let mut sec_wpos = String::new();
     let flush = |status: &Option<String>, tl, ii, em, prefix: &Vec<u32>, idx: &Vec<usize>,
-                 streams: &Vec<wordlist::StreamCkpt>,
+                 streams: &Vec<wordlist::StreamCkpt>, wpos: &String,
                  slots: &mut Vec<CkptSlot>| -> Result<()> {
         match status.as_deref() {
             None => {}
@@ -5494,6 +5071,7 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
             Some("in_progress") => slots.push(CkptSlot::InProgress(ThreadCkpt {
                 target_level: tl, init_idx: ii, emitted: em,
                 prefix: prefix.clone(), idx_stack: idx.clone(), streams: streams.clone(),
+                wordlist_pos: wpos.clone(),
             })),
             Some(other) => bail!("checkpoint: unknown status '{}'", other),
         }
@@ -5503,9 +5081,9 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
         if line.starts_with("[thread=") {
-            flush(&sec_status, sec_tl, sec_ii, sec_em, &sec_prefix, &sec_idx, &sec_streams, &mut slots)?;
+            flush(&sec_status, sec_tl, sec_ii, sec_em, &sec_prefix, &sec_idx, &sec_streams, &sec_wpos, &mut slots)?;
             sec_status = None; sec_tl = 0; sec_ii = 0; sec_em = 0;
-            sec_prefix.clear(); sec_idx.clear(); sec_streams.clear();
+            sec_prefix.clear(); sec_idx.clear(); sec_streams.clear(); sec_wpos.clear();
             continue;
         }
         let (k, v) = line.split_once('=').ok_or_else(|| anyhow!("checkpoint: bad line '{}'", line))?;
@@ -5521,10 +5099,11 @@ fn read_checkpoint(path: &Path) -> Result<CheckpointFile> {
             "prefix"       => sec_prefix = parse_csv_u32(v)?,
             "idx_stack"    => sec_idx = parse_csv_usize(v)?,
             "stream"       => sec_streams.push(wordlist::StreamCkpt::from_field(v)?),
+            "wordlist_pos" => sec_wpos = v.to_string(),
             _              => {} // tolerate unknown keys
         }
     }
-    flush(&sec_status, sec_tl, sec_ii, sec_em, &sec_prefix, &sec_idx, &sec_streams, &mut slots)?;
+    flush(&sec_status, sec_tl, sec_ii, sec_em, &sec_prefix, &sec_idx, &sec_streams, &sec_wpos, &mut slots)?;
     if threads != 0 && slots.len() != threads {
         bail!("checkpoint: header threads={} but found {} thread sections", threads, slots.len());
     }
@@ -5723,7 +5302,10 @@ fn session_start(model: &Path, count: Option<u64>, threads: usize, checkpoint_fi
         }
         for v in victims {
             if let Some(p) = session_path(&v.id) { let _ = std::fs::remove_file(p); }
-            if let Some(d) = sessions_dir() { let _ = std::fs::remove_file(d.join(format!("{}.ckpt", v.id))); }
+            if let Some(d) = sessions_dir() {
+                let _ = std::fs::remove_file(d.join(format!("{}.ckpt", v.id)));
+                let _ = std::fs::remove_file(d.join(format!("{}.ckpt.seen", v.id)));
+            }
         }
     }
     Some(id)
@@ -6233,6 +5815,7 @@ where
                         on_checkpoint(&ThreadCkpt {
                             target_level, init_idx: ii,
                             prefix: prefix.clone(), idx_stack, emitted, streams: Vec::new(),
+                            wordlist_pos: String::new(),
                         });
                         last_ckpt = Instant::now();
                     }
@@ -8391,63 +7974,98 @@ mod min_level_tests {
 
     #[test]
     fn default_and_in_range_accepted() {
-        assert!(validate_min_level(0, false, false).is_ok());
-        assert!(validate_min_level(30, false, false).is_ok());
-        assert!(validate_min_level(LEVEL_MAX, false, false).is_ok());
+        assert!(validate_min_level(0).is_ok());
+        assert!(validate_min_level(30).is_ok());
+        assert!(validate_min_level(LEVEL_MAX).is_ok());
     }
 
     #[test]
     fn rejects_past_level_max() {
-        assert!(validate_min_level(LEVEL_MAX + 1, false, false).is_err());
-    }
-
-    #[test]
-    fn rejects_graft_combination_but_not_the_default() {
-        assert!(validate_min_level(30, true, true).is_err());   // --float
-        assert!(validate_min_level(30, true, false).is_err());  // --prepend-only
-        assert!(validate_min_level(0,  true, true).is_ok());    // unset ⇒ no conflict
+        assert!(validate_min_level(LEVEL_MAX + 1).is_err());
     }
 }
 
 #[cfg(test)]
-mod graft_flag_tests {
-    use super::{ignore_graft_flags, Cli, GenerateArgs, DEFAULT_MAX_TOKENS};
+mod wordlist_route_tests {
+    use super::{build_args_fingerprint, ignore_anywhere_flags, retire_wordlist_flags, wordlist_gen,
+                Cli, GenerateArgs, WordlistGen};
     use clap::Parser;
+    use std::path::Path;
 
     fn parse(extra: &[&str]) -> GenerateArgs {
-        let mut v = vec!["tokenov", "--wordlist", "w.txt"];
+        let mut v = vec!["tokenov"];
         v.extend_from_slice(extra);
         Cli::try_parse_from(v).expect("parse").generate_args
     }
 
-    const ALL: &[&str] = &["--strict", "--threads", "3", "--max-tokens", "6", "--resume",
-        "--resume-state", "s.ckpt", "--checkpoint-file", "c.ckpt", "--unigram-tail", "0.3"];
-
-    /// On the graft path the seven flags are cleared (after a warning), so no
-    /// later code can act on them — 1.1.0 ignored them silently, and this keeps
-    /// its output while saying so.
-    #[test]
-    fn graft_clears_flags_it_cannot_honor() {
-        for g in ["--float", "--prepend-only"] {
-            let mut a = parse(&[&[g][..], ALL].concat());
-            ignore_graft_flags(&mut a, true);
-            assert!(!a.strict && !a.resume, "{g}");
-            assert!(a.threads.is_none() && a.resume_state.is_none(), "{g}");
-            assert!(a.checkpoint_file.is_none() && a.unigram_tail.is_none(), "{g}");
-            assert_eq!(a.max_tokens, DEFAULT_MAX_TOKENS, "{g}");
-        }
+    fn route(extra: &[&str]) -> (WordlistGen, GenerateArgs) {
+        let mut a = parse(extra);
+        retire_wordlist_flags(&mut a);
+        (wordlist_gen(&a), a)
     }
 
-    /// The enumerator path honors every one of these, so it must not touch them.
+    /// Every flag combination maps to one generator: the default (word
+    /// anywhere), --prepend-only (word last), --append-only and the retired
+    /// --mode seeded (the 1.3.0 seeded enumerator), --rare-first; --float and
+    /// --mode weighted/combined run the default.
     #[test]
-    fn enumerator_path_keeps_flags() {
-        let mut a = parse(ALL);
-        ignore_graft_flags(&mut a, false);
-        assert!(a.strict && a.resume);
-        assert_eq!(a.threads, Some(3));
-        assert_eq!(a.max_tokens, 6);
-        assert!(a.resume_state.is_some() && a.checkpoint_file.is_some());
-        assert_eq!(a.unigram_tail, Some(0.3));
+    fn every_combination_maps_to_a_generator() {
+        use WordlistGen::*;
+        let any = Anywhere { at_end: false };
+        let w = ["--wordlist", "w.txt"];
+        let r = |x: &[&str]| route(&[&w[..], x].concat()).0;
+        assert_eq!(route(&[]).0, None);
+        assert_eq!(route(&["--mode", "seeded"]).0, None);
+        assert_eq!(route(&["--float"]).0, None);
+        assert_eq!(r(&[]), any);
+        assert_eq!(r(&["--prepend-only"]), Anywhere { at_end: true });
+        assert_eq!(r(&["--append-only"]), Seeded);
+        assert_eq!(r(&["--float"]), any);
+        assert_eq!(r(&["--mode", "seeded"]), Seeded);
+        assert_eq!(r(&["--mode", "weighted"]), any);
+        assert_eq!(r(&["--mode", "combined"]), any);
+        assert_eq!(r(&["--mode", "weighted", "--append-only"]), Seeded);
+        assert_eq!(r(&["--seed-mode", "token"]), any);
+        assert_eq!(r(&["--seed-mode", "token", "--append-only"]), Seeded);
+        assert_eq!(r(&["--bias", "3"]), any);
+        assert_eq!(r(&["--rare-first"]), RareFirst);
+        assert_eq!(r(&["--rare-first", "--float"]), RareFirst);
+        assert_eq!(r(&["--rare-first", "--prepend-only"]), RareFirst);
+        // --float is cleared, so nothing downstream sees it.
+        assert!(!route(&[&w[..], &["--float"]].concat()).1.float);
+    }
+
+    /// Plain and --append-only fingerprints keep 1.3.0's text; the new default
+    /// is tagged (with --float the same run as without); the stream-changing
+    /// --case-shape / --enterprise / --variant are appended only when set.
+    #[test]
+    fn fingerprint_tags_only_what_changed() {
+        let m = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let fp = |x: &[&str]| build_args_fingerprint(&route(x).1, &m, 1).unwrap();
+        let plain = fp(&[]);
+        assert!(plain.ends_with(" mode=None bias=2 seed_mode=Entry prepend_only=false append_only=false \
+                                 float=false skipgram_expand=0 skipgram_direction=Both wordlist=None"), "{plain}");
+        let app = fp(&["--wordlist", "w.txt", "--append-only"]);
+        assert!(app.ends_with("append_only=true float=false skipgram_expand=0 skipgram_direction=Both \
+                               wordlist=Some(\"w.txt\")"), "{app}");
+        let any = fp(&["--wordlist", "w.txt"]);
+        assert!(any.contains(" wordlist_gen=anywhere wordlist_size=0 wordlist_mtime=0"), "{any}");
+        assert_eq!(any, fp(&["--wordlist", "w.txt", "--float"]));
+        assert!(fp(&["--wordlist", "w.txt", "--prepend-only"]).contains("prepend_only=true"));
+        assert!(fp(&["--bias", "3"]).contains(" bias=3 "));
+        assert!(fp(&["--case-shape", "cap1"]).ends_with(" case_shape=cap1"));
+        assert!(fp(&["--enterprise"]).ends_with(" enterprise=true"));
+        assert!(fp(&["--variant", "cap-tail"]).ends_with(" variant=cap-tail"));
+        assert!(fp(&["--variant", "baseline"]).ends_with("wordlist=None"));
+    }
+
+    #[test]
+    fn default_wordlist_clears_child_cache_flags() {
+        for f in [&["--lazy"][..], &["--force-child-cache"], &["--bounded-cap", "9"]] {
+            let mut a = parse(&[&["--wordlist", "w.txt"][..], f].concat());
+            ignore_anywhere_flags(&mut a);
+            assert!(!a.lazy_children && !a.force_child_cache && a.bounded_cap.is_none(), "{f:?}");
+        }
     }
 }
 

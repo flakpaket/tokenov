@@ -99,10 +99,10 @@ speed. See [docs/algorithm.md](docs/algorithm.md).
 
 `--wordlist FILE` takes a list of target-specific words (names, product names,
 brands, words scraped from the target's website) and builds every candidate
-around one of them intact, with characters the model adds after it: `cisco1`,
-`cisco2024!`. `--rare-first` instead gives the most candidates to the rarest
-words in your list and adds characters on either side (`ilovecisco`). See
-[docs/wordlist.md](docs/wordlist.md).
+around one of them intact, with characters the model adds before it, after it,
+or both: `cisco1`, `ilovecisco`, `#1cisco2024`. Candidates come out likeliest
+first across the whole list. `--append-only` and `--prepend-only` keep the
+additions to one side. See [docs/wordlist.md](docs/wordlist.md).
 
 ### Models carry their tokenizer
 
@@ -113,12 +113,28 @@ including for `--wordlist`, which must tokenize your words the same way. See
 
 ## What's new
 
+**Tokenov 1.4.0:**
+
+- **Anywhere:** `--wordlist` now places each word anywhere in the candidate.
+  The model adds characters before the word, after it, or both (`ilovecisco`,
+  `#1cisco2024`), and every candidate is ranked by how likely the model finds
+  the whole password. In our tests it cracked about 65% more than the previous
+  `--wordlist` at 100 million candidates, on leaked passwords that were mostly
+  for personal accounts rather than company systems, so expect different gains
+  on other data (details in [docs/wordlist.md](docs/wordlist.md)).
+  **`--wordlist` output changes;**
+  `--append-only` gives the old output. See [Upgrading](#upgrading).
+- `--prepend-only` now uses the same generator, with the word at the end.
+- Older ways of using a wordlist are retired. Old command lines still run,
+  with a warning; [docs/retired.md](docs/retired.md) says what runs instead.
+  `--rare-first` still works and will be deprecated in a future release.
+
 **Tokenov 1.3.0:**
 
 - `--rare-first`, a second way to target a wordlist that puts most of the
   candidates on the rarest words in your list.
-- `--float` and `--prepend-only` now work on large wordlists, such as a scraped
-  website.
+- Wordlist runs that add characters in front of words no longer stall on large
+  wordlists, such as a scraped website.
 - `tokenov bootstrap --rebuild` retrains the default model without downloading
   anything again.
 - New documentation: this README now covers getting started, and each topic
@@ -128,8 +144,8 @@ including for `--wordlist`, which must tokenize your words the same way. See
 
 - Candidates with non-ASCII characters (accented letters, other alphabets) come
   out exactly right instead of containing `�`.
-- `--count` is a hard limit with `--float` and `--prepend-only`, and
-  `--enterprise` and `--case-shape` now work with them.
+- In wordlist runs that add characters in front of words, `--count` is a hard
+  limit, and `--enterprise` and `--case-shape` work.
 
 **Tokenov 1.1.0:**
 
@@ -144,9 +160,25 @@ Full details are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Upgrading
 
-**From 1.2.0:** nothing breaks. Output without `--rare-first` is the same as
-1.2.0, except that `--float` and `--prepend-only` now finish on large wordlists
-where 1.2.0 stalled. `--rare-first` is new. See [CHANGELOG.md](CHANGELOG.md).
+**From 1.3.0:** plain `generate` (no `--wordlist`), `score`, `model`,
+`tokenizer` and `bootstrap` give the same output as 1.3.0. **`--wordlist`
+output changes:** it now adds characters before words as well as after
+them, in a different order. To get exactly the old `--wordlist` output, add
+`--append-only`. `--prepend-only` output also changes. Options retired in
+1.4.0 still run, with a warning, and are listed in
+[docs/retired.md](docs/retired.md).
+
+To keep using 1.3.0 instead, install it alongside or in place of 1.4.0:
+
+```bash
+cargo install tokenov --version 1.3.0 --locked --force
+# or build it from source:
+git clone https://github.com/flakpaket/tokenov && cd tokenov
+git checkout v1.3.0 && cargo build --release
+```
+
+**From 1.2.0:** everything under "From 1.3.0" applies. Plain `generate` output is
+the same as 1.2.0. See [CHANGELOG.md](CHANGELOG.md).
 
 **From 1.1.0:** also read the 1.2.0 entry in [CHANGELOG.md](CHANGELOG.md).
 Candidates containing non-ASCII characters changed, and output is no longer
@@ -165,7 +197,7 @@ or restart interrupted runs before upgrading.
 | page | covers |
 |---|---|
 | [generate](docs/generate.md) | standard mode, output format, `--min-level`, `--case-shape`, `--enterprise` |
-| [wordlist](docs/wordlist.md) | `--wordlist` targeting and its three generators |
+| [wordlist](docs/wordlist.md) | `--wordlist` targeting: the default, `--append-only`, `--prepend-only`, `--rare-first` |
 | [resume](docs/resume.md) | checkpoints, `--resume`, sessions, strict-mode resume |
 | [unigram-tail](docs/unigram-tail.md) | `--unigram-tail`: what it changes and when it pays off |
 | [score](docs/score.md) | `tokenov score`: Rarity, levels, output formats |

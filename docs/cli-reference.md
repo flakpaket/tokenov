@@ -28,19 +28,18 @@ table lists the main flags; `tokenov generate --help` lists all of them.
 | `--count <N>` | stop after N candidates (accepts K/M/B/T suffixes, e.g. `1B`) | unlimited |
 | `--output <PATH>` | output file: plain text, one candidate per line (usually but not always valid UTF-8); compress externally if you want | stdout |
 | `--threads <N>` | generation thread count (ignored under `--strict`, which is always single-threaded) | number of CPU cores |
-| `--min-len <N>` | minimum candidate length in bytes (characters under `--float` / `--prepend-only`) | 4 |
-| `--max-len <N>` | maximum candidate length in bytes (characters under `--float` / `--prepend-only`) | 30 |
+| `--min-len <N>` | minimum candidate length in bytes | 4 |
+| `--max-len <N>` | maximum candidate length in bytes | 30 |
 | `--max-tokens <N>` | maximum tokens per candidate | 12 |
 | `--min-tokens <N>` | minimum tokens per candidate; shorter candidates are skipped | 1 |
 | `--unigram-tail [FRACTION]` | also consider globally-frequent tokens at every step; FRACTION sets how strongly | (off; bare flag = 0.1) |
-| `--min-level <N>` | start the level sweep at level N, skipping the more-probable levels below it (0 = no-op) | 0 |
+| `--min-level <N>` | start the level sweep at level N, skipping the more-probable levels below it (0 = no-op; with `--wordlist` see [wordlist.md](wordlist.md)) | 0 |
 | `--case-shape <SPEC>` | re-case each token (per-slot `?l`/`?c`/`?u`, or `lower`/`cap1`/`title`/`upper`; `;`-separated) | (off) |
 | `--enterprise` | emit only policy-compliant candidates (≥8 chars + ≥3 of 5 classes; capitalize-first repair) | (off) |
-| `--wordlist <PATH>` | OSINT/target wordlist (one entry per line) | (none → standard mode) |
-| `--append-only` | add characters after each word only; the explicit spelling of the default | **default** for `--wordlist` |
-| `--float` | add characters on either side, rarest words first, from a fixed set of additions (single-threaded; see [wordlist.md](wordlist.md)) | (off) |
-| `--prepend-only` | as `--float`, but before the word only | (off) |
-| `--rare-first` | rarest words get the most candidates; the model adds characters on either side (one side with `--append-only` / `--prepend-only`) | (off) |
+| `--wordlist <PATH>` | target wordlist (one entry per line); the model adds characters before, after or on both sides of each word, likeliest first across all words | (none → standard mode) |
+| `--append-only` | with `--wordlist`: add characters after each word only (the output of `--wordlist` in tokenov 1.3 and earlier) | (off) |
+| `--prepend-only` | with `--wordlist`: add characters before each word only; the word ends the candidate | (off) |
+| `--rare-first` | rarest words get the most candidates; the model adds characters on either side (one side with `--append-only` / `--prepend-only`); to be deprecated | (off) |
 | `--rarity-weight <P>` | with `--rare-first`: each word's share ∝ rarity^P (0 = equal shares) | 1.0 |
 | `--mix` | with `--rare-first`: let other words from the list be used as additions (`johncisco`) | (off) |
 | `--no-split` | with `--rare-first`: don't use the parts of compound words (`johnsmith` → `john`, `smith`) as words | (off) |

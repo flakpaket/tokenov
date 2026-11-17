@@ -39,9 +39,7 @@ bytes, because `ñ` takes two bytes rather than one. So:
 If you are generating against a non-English target and your length bounds need
 to be exact, allow a byte or two of slack, or filter the output afterwards.
 
-This applies to standard mode, the default `--wordlist` generator and
-`--rare-first`. The exception is `--float` / `--prepend-only`: that generator
-counts characters, so there `--max-len 11` accepts `Contraseña1`.
+This applies to standard mode and every `--wordlist` generator.
 
 ### Why enterprise mode is different
 
