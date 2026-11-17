@@ -49,6 +49,9 @@ from 1.3.0.
 - **`--min-len` and `--max-len` count bytes everywhere.** The removed
   fixed-additions generator counted characters.
 - Checkpoints from earlier versions do not resume in 1.4.0.
+- `--lazy`, `--force-child-cache` and `--bounded-cap` have no effect with the
+  default `--wordlist` generator, which does not use that cache: they print a
+  warning and are ignored. They still work with `--append-only`.
 
 ### Retired
 
@@ -63,9 +66,6 @@ These are still accepted, print a warning and run something else. See
 
 ### Fixed
 
-- `--lazy`, `--force-child-cache` and `--bounded-cap` print a warning when the
-  run cannot use them (the default `--wordlist` generator) instead of being
-  silently ignored.
 - A checkpoint or progress file no longer resumes a run with a different
   `--case-shape` or `--enterprise` setting. Both change the output, and resuming
   across them mixed two different streams in one file.

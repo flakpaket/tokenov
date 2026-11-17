@@ -966,7 +966,10 @@ struct Rt {
 
 impl Rt {
     fn new(w: Box<dyn Write + Send>, target: u64, flush_bytes: usize) -> Self {
-        let seen_cap = if target < (1 << 32) { (target as usize) / SHARDS + 1 } else { 0 };
+        // Reserve for the run up front, but at most 2^26 lines (about 1 GB):
+        // a large --count must not allocate tens of GB before the first line.
+        // Capacity never changes the output.
+        let seen_cap = (target.min(1 << 26) as usize) / SHARDS + 1;
         Rt {
             seen: (0..SHARDS).map(|_| Mutex::new(FxHashSet::with_capacity_and_hasher(seen_cap, Default::default()))).collect(),
             emitted: AtomicU64::new(0), target, stop: AtomicBool::new(false),
