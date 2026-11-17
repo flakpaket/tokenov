@@ -5,7 +5,7 @@ All notable changes to tokenov are recorded here. Versions follow
 or model format, MINOR for new opt-in surface with unchanged default output,
 PATCH for fixes.
 
-## 1.4.0 — unreleased
+## 1.4.0 — 2026-11-17
 
 A better default for `--wordlist`. **`--wordlist` output changes; add
 `--append-only` to get exactly the output of earlier versions.** Output without
@@ -38,7 +38,9 @@ from 1.3.0.
   wordlist scraped from each company's website, on the passwords left after
   running that wordlist through hashcat's dive rules, it cracked about 65% more
   than the previous `--wordlist` at 100 million candidates, and more at every
-  company. See [docs/wordlist.md](docs/wordlist.md).
+  company. Those passwords came mostly from third-party sites (personal accounts
+  registered with a work email address), not from the companies' own systems, so
+  gains on corporate passwords may differ. See [docs/wordlist.md](docs/wordlist.md).
 - **`--append-only`** now selects the previous `--wordlist` generator. Its output
   is byte-identical to 1.3.0's `--wordlist` (and `--append-only`).
 - **`--prepend-only`** now runs the new generator with the word at the end of

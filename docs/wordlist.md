@@ -45,7 +45,11 @@ a corporate email address, leaked mostly from third-party sites), with a
 wordlist scraped from each company's website, on the passwords left after
 running that wordlist through hashcat's dive rules, the default cracked about
 65% more than `--append-only` (the `--wordlist` of tokenov 1.3 and earlier) at
-100 million candidates, and more at every one of the nine companies.
+100 million candidates, and more at every one of the nine companies. Because
+these were mostly passwords for personal accounts, not for the companies' own
+systems (only about 6% met a typical domain complexity policy), treat the
+figure as a comparison between the two generators, not a prediction for a
+corporate password audit.
 
 **Memory.** To keep lines unique, tokenov remembers every candidate it has
 printed: about 16 bytes each, so 1.6 GB per 100 million. A run without

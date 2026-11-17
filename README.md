@@ -119,7 +119,10 @@ including for `--wordlist`, which must tokenize your words the same way. See
   The model adds characters before the word, after it, or both (`ilovecisco`,
   `#1cisco2024`), and every candidate is ranked by how likely the model finds
   the whole password. In our tests it cracked about 65% more than the previous
-  `--wordlist` at 100 million candidates. **`--wordlist` output changes;**
+  `--wordlist` at 100 million candidates, on leaked passwords that were mostly
+  for personal accounts rather than company systems, so expect different gains
+  on other data (details in [docs/wordlist.md](docs/wordlist.md)).
+  **`--wordlist` output changes;**
   `--append-only` gives the old output. See [Upgrading](#upgrading).
 - `--prepend-only` now uses the same generator, with the word at the end.
 - Older ways of using a wordlist are retired. Old command lines still run,
@@ -130,8 +133,8 @@ including for `--wordlist`, which must tokenize your words the same way. See
 
 - `--rare-first`, a second way to target a wordlist that puts most of the
   candidates on the rarest words in your list.
-- `--float` and `--prepend-only` now work on large wordlists, such as a scraped
-  website.
+- Wordlist runs that add characters in front of words no longer stall on large
+  wordlists, such as a scraped website.
 - `tokenov bootstrap --rebuild` retrains the default model without downloading
   anything again.
 - New documentation: this README now covers getting started, and each topic
@@ -141,8 +144,8 @@ including for `--wordlist`, which must tokenize your words the same way. See
 
 - Candidates with non-ASCII characters (accented letters, other alphabets) come
   out exactly right instead of containing `�`.
-- `--count` is a hard limit with `--float` and `--prepend-only`, and
-  `--enterprise` and `--case-shape` now work with them.
+- In wordlist runs that add characters in front of words, `--count` is a hard
+  limit, and `--enterprise` and `--case-shape` work.
 
 **Tokenov 1.1.0:**
 
@@ -174,9 +177,8 @@ git clone https://github.com/flakpaket/tokenov && cd tokenov
 git checkout v1.3.0 && cargo build --release
 ```
 
-**From 1.2.0:** nothing breaks. Output without `--rare-first` is the same as
-1.2.0, except that `--float` and `--prepend-only` now finish on large wordlists
-where 1.2.0 stalled. `--rare-first` is new. See [CHANGELOG.md](CHANGELOG.md).
+**From 1.2.0:** everything under "From 1.3.0" applies. Plain `generate` output is
+the same as 1.2.0. See [CHANGELOG.md](CHANGELOG.md).
 
 **From 1.1.0:** also read the 1.2.0 entry in [CHANGELOG.md](CHANGELOG.md).
 Candidates containing non-ASCII characters changed, and output is no longer
