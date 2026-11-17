@@ -5,6 +5,43 @@ All notable changes to tokenov are recorded here. Versions follow
 or model format, MINOR for new opt-in surface with unchanged default output,
 PATCH for fixes.
 
+## 1.4.1 — unreleased
+
+**`--append-only` output changes in 1.4.1.** Use the new `--append-only-legacy`
+to get the output `--append-only` gave in 1.4.0, which is also the output of
+`--wordlist` in 1.3. Plain `generate`, `--wordlist`, `--prepend-only`,
+`--rare-first`, `score`, `model`, `tokenizer` and `bootstrap` are unchanged from
+1.4.0.
+
+### Changed
+
+- **`--append-only` runs the same generator as `--wordlist`**, with each word at
+  the start of the candidate and the model adding characters after it
+  (`cisco2024!`). The three placements (anywhere, `--append-only`,
+  `--prepend-only`) now work the same way. Compared with 1.4.0's
+  `--append-only`, mostly the same lines come out, in the same order, except:
+  - every line is unique (the old generator could print a password more than
+    once, built from different token splits), so `--count` reaches a little
+    further;
+  - words with a step the model has no statistics for come out too, later
+    than common words, instead of being skipped.
+- `--mode weighted` and `--mode combined` together with `--append-only` now run
+  the new `--append-only`.
+- Checkpoints from 1.4.0 do not resume in 1.4.1.
+
+### Added
+
+- **`--append-only-legacy`** reproduces tokenov 1.3-era `--wordlist` results:
+  its output is byte-identical to 1.4.0's `--append-only` and 1.3.0's
+  `--wordlist`. It cannot be combined with `--rare-first`. `--lazy`,
+  `--force-child-cache`, `--bounded-cap` and the retired `--seed-mode` work
+  with it as they did with 1.4.0's `--append-only`.
+
+### Retired
+
+- **`--mode seeded`** now runs `--append-only-legacy` (with or without
+  `--append-only`), with the same output as in 1.4.0.
+
 ## 1.4.0 — 2026-11-17
 
 A better default for `--wordlist`. **`--wordlist` output changes; add

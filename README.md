@@ -113,6 +113,15 @@ including for `--wordlist`, which must tokenize your words the same way. See
 
 ## What's new
 
+**Tokenov 1.4.1:**
+
+- `--append-only` now uses the same generator as `--wordlist`, with the word
+  at the start of the candidate, so all three placements (anywhere,
+  `--append-only`, `--prepend-only`) work the same way. **`--append-only`
+  output changes;** the new `--append-only-legacy` reproduces tokenov 1.3-era
+  `--wordlist` results (and 1.4.0's `--append-only`). See
+  [Upgrading](#upgrading).
+
 **Tokenov 1.4.0:**
 
 - **Anywhere:** `--wordlist` now places each word anywhere in the candidate.
@@ -122,8 +131,8 @@ including for `--wordlist`, which must tokenize your words the same way. See
   `--wordlist` at 100 million candidates, on leaked passwords that were mostly
   for personal accounts rather than company systems, so expect different gains
   on other data (details in [docs/wordlist.md](docs/wordlist.md)).
-  **`--wordlist` output changes;**
-  `--append-only` gives the old output. See [Upgrading](#upgrading).
+  **`--wordlist` output changes;** the old output is still available (since
+  1.4.1 as `--append-only-legacy`). See [Upgrading](#upgrading).
 - `--prepend-only` now uses the same generator, with the word at the end.
 - Older ways of using a wordlist are retired. Old command lines still run,
   with a warning; [docs/retired.md](docs/retired.md) says what runs instead.
@@ -160,15 +169,21 @@ Full details are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Upgrading
 
-**From 1.3.0:** plain `generate` (no `--wordlist`), `score`, `model`,
-`tokenizer` and `bootstrap` give the same output as 1.3.0. **`--wordlist`
-output changes:** it now adds characters before words as well as after
-them, in a different order. To get exactly the old `--wordlist` output, add
-`--append-only`. `--prepend-only` output also changes. Options retired in
-1.4.0 still run, with a warning, and are listed in
-[docs/retired.md](docs/retired.md).
+**From 1.4.0:** plain `generate`, `--wordlist`, `--prepend-only`,
+`--rare-first`, `score`, `model`, `tokenizer` and `bootstrap` give the same
+output as 1.4.0. **`--append-only` output changes:** it now runs the same
+generator as `--wordlist`, with the word at the start. To get exactly 1.4.0's
+`--append-only` output, use `--append-only-legacy` instead.
 
-To keep using 1.3.0 instead, install it alongside or in place of 1.4.0:
+**From 1.3.0:** everything under "From 1.4.0" applies. Plain `generate` (no
+`--wordlist`) gives the same output as 1.3.0. **`--wordlist` output changes:**
+it now adds characters before words as well as after them, in a different
+order. To get exactly the old `--wordlist` output, use
+`--append-only-legacy` (it reproduces tokenov 1.3-era `--wordlist` results).
+`--prepend-only` output also changes. Options retired in 1.4.0 still run, with
+a warning, and are listed in [docs/retired.md](docs/retired.md).
+
+To keep using 1.3.0 instead, install it alongside or in place of 1.4:
 
 ```bash
 cargo install tokenov --version 1.3.0 --locked --force
@@ -197,7 +212,7 @@ or restart interrupted runs before upgrading.
 | page | covers |
 |---|---|
 | [generate](docs/generate.md) | standard mode, output format, `--min-level`, `--case-shape`, `--enterprise` |
-| [wordlist](docs/wordlist.md) | `--wordlist` targeting: the default, `--append-only`, `--prepend-only`, `--rare-first` |
+| [wordlist](docs/wordlist.md) | `--wordlist` targeting: the default, `--append-only`, `--prepend-only`, `--append-only-legacy`, `--rare-first` |
 | [resume](docs/resume.md) | checkpoints, `--resume`, sessions, strict-mode resume |
 | [unigram-tail](docs/unigram-tail.md) | `--unigram-tail`: what it changes and when it pays off |
 | [score](docs/score.md) | `tokenov score`: Rarity, levels, output formats |

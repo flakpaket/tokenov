@@ -612,8 +612,8 @@ struct GenerateArgs {
     no_split: bool,
 
     /// Retired (prints a warning). `seeded` runs --append-only-legacy;
-    /// `weighted` and `combined` run the default --wordlist generator (or the
-    /// placement flag given). See docs/retired.md.
+    /// `weighted` and `combined` run the default --wordlist generator (or
+    /// --append-only / --append-only-legacy when given). See docs/retired.md.
     #[arg(long, value_enum, hide = true)]
     mode: Option<Mode>,
 
@@ -676,8 +676,8 @@ struct GenerateArgs {
     /// candidates concentrate at higher levels, but the overlap is wide — this is
     /// a stream-volume knob, not a length filter; use it with --min-len. Run with
     /// -v to see the level a run stopped at. With --wordlist (except
-    /// --append-only and --rare-first), about 1% of lines can repeat ones the
-    /// full run printed below level N; see docs/wordlist.md.
+    /// --append-only-legacy and --rare-first), about 1% of lines can repeat ones
+    /// the full run printed below level N; see docs/wordlist.md.
     #[arg(long, default_value_t = 0, value_name = "N", help_heading = "Generation")]
     min_level: u32,
 
@@ -704,8 +704,8 @@ struct GenerateArgs {
     /// sidecar. Args must match the original run; if nothing is resumable, run
     /// without `--resume`.
     ///
-    /// With `--wordlist` (except `--append-only` and `--rare-first`), the run
-    /// re-generates the unfinished part of the level it was on and writes no
+    /// With `--wordlist` (except `--append-only-legacy` and `--rare-first`), the
+    /// run re-generates the unfinished part of the level it was on and writes no
     /// line twice; strict resume then works on stdout too. See docs/resume.md.
     #[arg(long, default_value_t = false, help_heading = "Resume & checkpointing")]
     resume: bool,
@@ -2785,8 +2785,8 @@ fn wordlist_gen(args: &GenerateArgs) -> WordlistGen {
 ///   sides); with --rare-first it is ignored (that is already its default side).
 /// * `--mode seeded` is --append-only-legacy (the same seeded enumerator, same
 ///   output, with or without --append-only); `--mode weighted|combined` run the
-///   default generator or the placement flag given (the bias they applied is
-///   gone); `--bias` has no effect.
+///   default generator, or --append-only / --append-only-legacy when given (the
+///   bias they applied is gone); `--bias` has no effect.
 /// * `--seed-mode` is still honored by --append-only-legacy, so its output
 ///   stays the same as 1.3.0's, and ignored elsewhere.
 fn retire_wordlist_flags(args: &mut GenerateArgs) {
