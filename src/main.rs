@@ -523,7 +523,8 @@ struct GenerateArgs {
     /// before it, after it, or both (`ilovecisco`, `cisco2024!`, `#1cisco`), and
     /// candidates come out likeliest first across all words, priced as the model
     /// prices any password. Output lines are unique. --append-only and
-    /// --prepend-only keep the additions to one side; --rare-first is an
+    /// --prepend-only keep the additions to one side; --append-only-legacy
+    /// reproduces tokenov 1.3-era --wordlist results; --rare-first is an
     /// alternative generator. See docs/wordlist.md.
     #[arg(long, help_heading = "Generation")]
     wordlist: Option<PathBuf>,
@@ -537,13 +538,23 @@ struct GenerateArgs {
     /// Each word starts the candidate; the model adds characters after it only
     /// (`cisco2024`).
     ///
-    /// This is how --wordlist worked before tokenov 1.4.0, and gives the same
-    /// output as 1.3.0's --wordlist. With --rare-first: keeps the added
-    /// characters after the word.
+    /// The default generator with nothing before the word. With --rare-first:
+    /// keeps the added characters after the word.
     ///
-    /// Only one of --append-only and --prepend-only can be given.
+    /// Only one of --append-only, --append-only-legacy and --prepend-only can
+    /// be given.
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     append_only: bool,
+
+    /// Each word starts the candidate, generated as tokenov 1.3 did: reproduces
+    /// tokenov 1.3-era --wordlist results.
+    ///
+    /// Gives the same output as --wordlist in tokenov 1.3 and --append-only
+    /// in tokenov 1.4.0. Use it to repeat an earlier run; --append-only is the
+    /// current generator for the same placement. Cannot be combined with
+    /// --rare-first.
+    #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
+    append_only_legacy: bool,
 
     /// Each word ends the candidate; the model adds characters before it only
     /// (`ilovecisco`, `2024cisco`).
@@ -600,8 +611,9 @@ struct GenerateArgs {
     #[arg(long, default_value_t = false, help_heading = "Wordlist targeting")]
     no_split: bool,
 
-    /// Retired (prints a warning). `seeded` runs --append-only; `weighted` and
-    /// `combined` run the default --wordlist generator. See docs/retired.md.
+    /// Retired (prints a warning). `seeded` runs --append-only-legacy;
+    /// `weighted` and `combined` run the default --wordlist generator (or the
+    /// placement flag given). See docs/retired.md.
     #[arg(long, value_enum, hide = true)]
     mode: Option<Mode>,
 
@@ -609,7 +621,7 @@ struct GenerateArgs {
     #[arg(long, hide = true)]
     bias: Option<f32>,
 
-    /// Retired (prints a warning). Still honored by --append-only, where
+    /// Retired (prints a warning). Still honored by --append-only-legacy, where
     /// `token` starts candidates with each distinct token of the list instead
     /// of each word; ignored otherwise. See docs/retired.md.
     #[arg(long, value_enum, hide = true)]
@@ -2745,10 +2757,12 @@ enum WordlistGen {
     /// No --wordlist: standard generation.
     None,
     /// The default: each word anywhere in the candidate (anywhere.rs);
-    /// `at_end` = --prepend-only, the word ends the candidate.
-    Anywhere { at_end: bool },
-    /// --append-only (and the retired --mode seeded): the seeded enumerator,
-    /// the --wordlist generator of 1.3.0 and earlier.
+    /// `Place::Start` = --append-only (word first), `Place::End` =
+    /// --prepend-only (word last).
+    Anywhere { place: anywhere::Place },
+    /// --append-only-legacy (and the retired --mode seeded): the seeded
+    /// enumerator, the --wordlist generator of 1.3.0 and earlier (and
+    /// --append-only in 1.4.0).
     Seeded,
     /// --rare-first (wordlist.rs), on the side the side flags name.
     RareFirst,
@@ -2758,19 +2772,23 @@ enum WordlistGen {
 fn wordlist_gen(args: &GenerateArgs) -> WordlistGen {
     if args.wordlist.is_none() { return WordlistGen::None; }
     if args.rare_first { return WordlistGen::RareFirst; }
-    if args.append_only || args.mode == Some(Mode::Seeded) { return WordlistGen::Seeded; }
-    WordlistGen::Anywhere { at_end: args.prepend_only }
+    if args.append_only_legacy || args.mode == Some(Mode::Seeded) { return WordlistGen::Seeded; }
+    let place = if args.append_only { anywhere::Place::Start }
+        else if args.prepend_only { anywhere::Place::End }
+        else { anywhere::Place::Anywhere };
+    WordlistGen::Anywhere { place }
 }
 
 /// Warn about the retired --wordlist flags and clear --float, the one that is
 /// ignored outright. They stay accepted so old scripts keep running:
 /// * `--float` runs the default generator (which also adds characters on both
 ///   sides); with --rare-first it is ignored (that is already its default side).
-/// * `--mode seeded` is --append-only (the same seeded enumerator, same output);
-///   `--mode weighted|combined` run the default generator (the bias they applied
-///   is gone); `--bias` has no effect.
-/// * `--seed-mode` is still honored by --append-only, so its output stays the
-///   same as 1.3.0's, and ignored elsewhere.
+/// * `--mode seeded` is --append-only-legacy (the same seeded enumerator, same
+///   output, with or without --append-only); `--mode weighted|combined` run the
+///   default generator or the placement flag given (the bias they applied is
+///   gone); `--bias` has no effect.
+/// * `--seed-mode` is still honored by --append-only-legacy, so its output
+///   stays the same as 1.3.0's, and ignored elsewhere.
 fn retire_wordlist_flags(args: &mut GenerateArgs) {
     let wl = args.wordlist.is_some();
     if args.float {
@@ -2786,7 +2804,8 @@ fn retire_wordlist_flags(args: &mut GenerateArgs) {
     if let Some(m) = args.mode {
         let name = match m { Mode::Weighted => "weighted", Mode::Seeded => "seeded", Mode::Combined => "combined" };
         let what = if !wl { "has no effect without --wordlist (ignored)" }
-            else if m == Mode::Seeded { "is retired: it is the same as --append-only, which runs instead" }
+            else if m == Mode::Seeded { "is retired: it is the same as --append-only-legacy, which runs instead" }
+            else if args.append_only_legacy { "is retired and ignored: running --append-only-legacy" }
             else if args.append_only { "is retired and ignored: running --append-only" }
             else { "is retired: running the default --wordlist generator instead" };
         warn_msg(&format!("warning: --mode {name} {what}. See docs/retired.md."));
@@ -2796,10 +2815,11 @@ fn retire_wordlist_flags(args: &mut GenerateArgs) {
     }
     if args.seed_mode.is_some() {
         if wordlist_gen(args) == WordlistGen::Seeded {
-            warn_msg("warning: --seed-mode is retired; --append-only still honors it in this release. \
+            warn_msg("warning: --seed-mode is retired; --append-only-legacy still honors it in this release. \
                       See docs/retired.md.");
         } else {
-            warn_msg("warning: --seed-mode is retired and has no effect here (ignored). See docs/retired.md.");
+            warn_msg("warning: --seed-mode is retired and has no effect here (ignored); only \
+                      --append-only-legacy honors it. See docs/retired.md.");
         }
     }
 }
@@ -2813,7 +2833,7 @@ fn ignore_anywhere_flags(args: &mut GenerateArgs) {
     if args.force_child_cache      { bad.push("--force-child-cache"); args.force_child_cache = false; }
     if args.bounded_cap.is_some()  { bad.push("--bounded-cap");       args.bounded_cap = None; }
     if bad.is_empty() { return; }
-    warn_msg(&format!("warning: {} {} no effect with --wordlist (ignored); add --append-only to use {}.",
+    warn_msg(&format!("warning: {} {} no effect with --wordlist (ignored); add --append-only-legacy to use {}.",
         bad.join(", "), if bad.len() == 1 { "has" } else { "have" }, if bad.len() == 1 { "it" } else { "them" }));
 }
 
@@ -2861,8 +2881,8 @@ fn anywhere_resume_cfg(args: &GenerateArgs, model_path: &Path, n_threads: usize)
 /// `--rare-first`: the side the rarity-first generator (wordlist.rs) runs on,
 /// or `None` when the run doesn't use it. Its tuning flags need it: without
 /// --rare-first a `--wordlist` run uses the default generator or the seeded
-/// enumerator (--append-only), neither of which reads them. Call after the side
-/// flags are checked for exclusivity.
+/// enumerator (--append-only-legacy), neither of which reads them. Call after
+/// the side flags are checked for exclusivity.
 fn wordlist_side(args: &GenerateArgs) -> Result<Option<wordlist::Side>> {
     if !args.rare_first {
         for (set, f) in [(args.mix, "--mix"), (args.no_split, "--no-split"),
@@ -2876,12 +2896,34 @@ fn wordlist_side(args: &GenerateArgs) -> Result<Option<wordlist::Side>> {
         bail!("--mode (legacy) cannot be combined with --rare-first — they select \
                different generators. Drop one of them.");
     }
+    if args.append_only_legacy {
+        bail!("--append-only-legacy cannot be combined with --rare-first — they select \
+               different generators. Use --append-only with --rare-first to keep the added \
+               characters after the word.");
+    }
     if !(args.rarity_weight >= 0.0 && args.rarity_weight.is_finite()) {
         bail!("--rarity-weight must be a finite number >= 0 (got {})", args.rarity_weight);
     }
     Ok(Some(if args.append_only { wordlist::Side::Append }
         else if args.prepend_only { wordlist::Side::Prepend }
         else { wordlist::Side::Float }))
+}
+
+/// The placement flags that cannot be combined. Call before
+/// `retire_wordlist_flags` (which clears --float).
+fn wordlist_flag_conflicts(args: &GenerateArgs) -> Result<()> {
+    if [args.append_only, args.append_only_legacy, args.prepend_only, args.float].iter().filter(|&&x| x).count() > 1 {
+        bail!("--append-only, --append-only-legacy, --prepend-only, and --float are mutually exclusive");
+    }
+    // Kept from 1.3.0, where these were different generators.
+    if args.mode.is_some() && (args.prepend_only || args.float) {
+        bail!("--mode (legacy) cannot be combined with {} — they select different \
+               generators. Drop --mode to use {}, or drop {} to use --mode.",
+            if args.float { "--float" } else { "--prepend-only" },
+            if args.float { "--float" } else { "--prepend-only" },
+            if args.float { "--float" } else { "--prepend-only" });
+    }
+    Ok(())
 }
 
 fn run_generate(mut args: GenerateArgs) -> Result<()> {
@@ -2917,25 +2959,17 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             args.min_tokens, args.max_tokens);
     }
     // A --wordlist runs the default generator (anywhere.rs: each word anywhere
-    // in the candidate; --prepend-only = word last). --append-only runs the
-    // seeded enumerator, the --wordlist generator of 1.3.0 and earlier.
+    // in the candidate; --append-only = word first, --prepend-only = word
+    // last). --append-only-legacy runs the seeded enumerator, the --wordlist
+    // generator of 1.3.0 and earlier (and 1.4.0's --append-only).
     // --rare-first selects the rarity-first generator (wordlist.rs) instead, on
     // the side the side flags name (default both). --float and --mode are
     // retired (see retire_wordlist_flags).
-    if [args.append_only, args.prepend_only, args.float].iter().filter(|&&x| x).count() > 1 {
-        bail!("--append-only, --prepend-only, and --float are mutually exclusive");
-    }
-    // Kept from 1.3.0, where these were different generators.
-    if args.mode.is_some() && (args.prepend_only || args.float) {
-        bail!("--mode (legacy) cannot be combined with {} — they select different \
-               generators. Drop --mode to use {}, or drop {} to use --mode.",
-            if args.float { "--float" } else { "--prepend-only" },
-            if args.float { "--float" } else { "--prepend-only" },
-            if args.float { "--float" } else { "--prepend-only" });
-    }
+    wordlist_flag_conflicts(&args)?;
     let wl_side = wordlist_side(&args)?;
     if args.wordlist.is_none() {
         let named: Vec<&str> = [(args.append_only, "--append-only"),
+            (args.append_only_legacy, "--append-only-legacy"),
             (args.prepend_only, "--prepend-only"), (args.float, "--float")]
             .iter().filter(|(on, _)| *on).map(|(_, f)| *f).collect();
         if !named.is_empty() {
@@ -3042,11 +3076,11 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             n_ctx_before));
     }
 
-    // The default --wordlist generator (and --prepend-only): its own level sweep
-    // over (prefix, word, suffix), so it returns here, before the seeded /
-    // rare-first setup and the child cache (and before the trigram drop: it
-    // prices words with the raw tiers).
-    if let WordlistGen::Anywhere { at_end } = wl_gen {
+    // The default --wordlist generator (and --append-only / --prepend-only):
+    // its own level sweep over (prefix, word, suffix), so it returns here,
+    // before the seeded / rare-first setup and the child cache (and before the
+    // trigram drop: it prices words with the raw tiers).
+    if let WordlistGen::Anywhere { place } = wl_gen {
         drop(wl_tokenizer);
         let n_threads = if args.strict {
             if let Some(t) = args.threads {
@@ -3063,7 +3097,7 @@ fn run_generate(mut args: GenerateArgs) -> Result<()> {
             max_tokens: args.max_tokens, min_tokens: args.min_tokens,
             min_len: args.min_len, max_len: args.max_len,
             enterprise: args.enterprise, case_masks: parse_case_masks(&args.case_shape)?,
-            word_at_end: at_end, word_unigram: Some(anywhere::WORD_UNIGRAM_F),
+            place, word_unigram: Some(anywhere::WORD_UNIGRAM_F),
             no_prune: std::env::var_os(anywhere::NO_PRUNE_ENV).is_some(),
         };
         let inp = anywhere::Inputs {
@@ -4839,10 +4873,12 @@ fn build_args_fingerprint(
         write!(s, "unigram_tail={} ", f).unwrap();
     }
     // The retired --bias / --seed-mode print their old defaults when unset, so
-    // fingerprints stay byte-identical to earlier releases.
+    // fingerprints stay byte-identical to earlier releases. --append-only-legacy
+    // prints as 1.4.0's --append-only (the same stream); the 1.4.1 --append-only
+    // is told apart by the `wordlist_gen=anywhere` tag below.
     write!(s, "mode={:?} bias={} seed_mode={:?} prepend_only={} append_only={} float={} ",
         args.mode, args.bias.unwrap_or(2.0), args.seed_mode.unwrap_or(SeedMode::Entry),
-        args.prepend_only, args.append_only, args.float).unwrap();
+        args.prepend_only, args.append_only || args.append_only_legacy, args.float).unwrap();
     write!(s, "skipgram_expand={} skipgram_direction={:?} ",
         args.skipgram_expand, args.skipgram_direction).unwrap();
     write!(s, "wordlist={:?}", args.wordlist).unwrap();
@@ -7987,7 +8023,7 @@ mod min_level_tests {
 
 #[cfg(test)]
 mod wordlist_route_tests {
-    use super::{build_args_fingerprint, ignore_anywhere_flags, retire_wordlist_flags, wordlist_gen,
+    use super::{build_args_fingerprint, ignore_anywhere_flags, retire_wordlist_flags, wordlist_flag_conflicts, wordlist_gen,
                 Cli, GenerateArgs, WordlistGen};
     use clap::Parser;
     use std::path::Path;
@@ -8005,28 +8041,38 @@ mod wordlist_route_tests {
     }
 
     /// Every flag combination maps to one generator: the default (word
-    /// anywhere), --prepend-only (word last), --append-only and the retired
-    /// --mode seeded (the 1.3.0 seeded enumerator), --rare-first; --float and
-    /// --mode weighted/combined run the default.
+    /// anywhere), --append-only (word first), --prepend-only (word last),
+    /// --append-only-legacy and the retired --mode seeded (the 1.3.0 seeded
+    /// enumerator), --rare-first; --float and --mode weighted/combined run the
+    /// default (or the placement flag given).
     #[test]
     fn every_combination_maps_to_a_generator() {
         use WordlistGen::*;
-        let any = Anywhere { at_end: false };
+        use crate::anywhere::Place;
+        let any = Anywhere { place: Place::Anywhere };
+        let start = Anywhere { place: Place::Start };
         let w = ["--wordlist", "w.txt"];
         let r = |x: &[&str]| route(&[&w[..], x].concat()).0;
         assert_eq!(route(&[]).0, None);
         assert_eq!(route(&["--mode", "seeded"]).0, None);
         assert_eq!(route(&["--float"]).0, None);
         assert_eq!(r(&[]), any);
-        assert_eq!(r(&["--prepend-only"]), Anywhere { at_end: true });
-        assert_eq!(r(&["--append-only"]), Seeded);
+        assert_eq!(r(&["--prepend-only"]), Anywhere { place: Place::End });
+        assert_eq!(r(&["--append-only"]), start);
+        assert_eq!(r(&["--append-only-legacy"]), Seeded);
+        assert_eq!(route(&["--append-only-legacy"]).0, None);
         assert_eq!(r(&["--float"]), any);
         assert_eq!(r(&["--mode", "seeded"]), Seeded);
+        assert_eq!(r(&["--mode", "seeded", "--append-only"]), Seeded);
+        assert_eq!(r(&["--mode", "seeded", "--append-only-legacy"]), Seeded);
         assert_eq!(r(&["--mode", "weighted"]), any);
         assert_eq!(r(&["--mode", "combined"]), any);
-        assert_eq!(r(&["--mode", "weighted", "--append-only"]), Seeded);
+        assert_eq!(r(&["--mode", "weighted", "--append-only"]), start);
+        assert_eq!(r(&["--mode", "weighted", "--append-only-legacy"]), Seeded);
         assert_eq!(r(&["--seed-mode", "token"]), any);
-        assert_eq!(r(&["--seed-mode", "token", "--append-only"]), Seeded);
+        assert_eq!(r(&["--seed-mode", "token", "--append-only"]), start);
+        assert_eq!(r(&["--seed-mode", "token", "--append-only-legacy"]), Seeded);
+        assert_eq!(r(&["--rare-first", "--append-only"]), RareFirst);
         assert_eq!(r(&["--bias", "3"]), any);
         assert_eq!(r(&["--rare-first"]), RareFirst);
         assert_eq!(r(&["--rare-first", "--float"]), RareFirst);
@@ -8035,9 +8081,11 @@ mod wordlist_route_tests {
         assert!(!route(&[&w[..], &["--float"]].concat()).1.float);
     }
 
-    /// Plain and --append-only fingerprints keep 1.3.0's text; the new default
-    /// is tagged (with --float the same run as without); the stream-changing
-    /// --case-shape / --enterprise / --variant are appended only when set.
+    /// Plain and --append-only-legacy fingerprints keep 1.3.0's text (legacy
+    /// prints as 1.4.0's --append-only, the same stream); the new default and
+    /// the 1.4.1 --append-only are tagged (with --float the same run as
+    /// without); the stream-changing --case-shape / --enterprise / --variant
+    /// are appended only when set.
     #[test]
     fn fingerprint_tags_only_what_changed() {
         let m = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
@@ -8045,18 +8093,46 @@ mod wordlist_route_tests {
         let plain = fp(&[]);
         assert!(plain.ends_with(" mode=None bias=2 seed_mode=Entry prepend_only=false append_only=false \
                                  float=false skipgram_expand=0 skipgram_direction=Both wordlist=None"), "{plain}");
+        let leg = fp(&["--wordlist", "w.txt", "--append-only-legacy"]);
+        assert!(leg.ends_with(" mode=None bias=2 seed_mode=Entry prepend_only=false append_only=true \
+                               float=false skipgram_expand=0 skipgram_direction=Both \
+                               wordlist=Some(\"w.txt\")"), "{leg}");
         let app = fp(&["--wordlist", "w.txt", "--append-only"]);
-        assert!(app.ends_with("append_only=true float=false skipgram_expand=0 skipgram_direction=Both \
-                               wordlist=Some(\"w.txt\")"), "{app}");
+        assert!(app.contains(" append_only=true ") && app.contains(" wordlist_gen=anywhere "), "{app}");
+        assert_ne!(app, leg);
+        // --mode seeded keeps its 1.4.0 text (it runs the same stream as before).
+        let ms = fp(&["--wordlist", "w.txt", "--mode", "seeded"]);
+        assert!(ms.contains(" mode=Some(Seeded) ") && ms.contains(" append_only=false ")
+                && !ms.contains("wordlist_gen"), "{ms}");
         let any = fp(&["--wordlist", "w.txt"]);
         assert!(any.contains(" wordlist_gen=anywhere wordlist_size=0 wordlist_mtime=0"), "{any}");
         assert_eq!(any, fp(&["--wordlist", "w.txt", "--float"]));
         assert!(fp(&["--wordlist", "w.txt", "--prepend-only"]).contains("prepend_only=true"));
+        assert_ne!(app, any);
+        assert_ne!(app, fp(&["--wordlist", "w.txt", "--prepend-only"]));
         assert!(fp(&["--bias", "3"]).contains(" bias=3 "));
         assert!(fp(&["--case-shape", "cap1"]).ends_with(" case_shape=cap1"));
         assert!(fp(&["--enterprise"]).ends_with(" enterprise=true"));
         assert!(fp(&["--variant", "cap-tail"]).ends_with(" variant=cap-tail"));
         assert!(fp(&["--variant", "baseline"]).ends_with("wordlist=None"));
+    }
+
+    /// --append-only-legacy excludes the other placement flags, as
+    /// --append-only does; --mode only conflicts with --prepend-only / --float.
+    #[test]
+    fn placement_flags_conflict() {
+        let w = ["--wordlist", "w.txt"];
+        let c = |x: &[&str]| wordlist_flag_conflicts(&parse(&[&w[..], x].concat()));
+        for ok in [&[][..], &["--append-only"], &["--append-only-legacy"], &["--prepend-only"],
+                   &["--mode", "seeded", "--append-only"], &["--mode", "seeded", "--append-only-legacy"],
+                   &["--mode", "weighted", "--append-only"], &["--rare-first", "--append-only"]] {
+            assert!(c(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [&["--append-only", "--append-only-legacy"][..], &["--append-only-legacy", "--prepend-only"],
+                    &["--append-only-legacy", "--float"], &["--append-only", "--prepend-only"],
+                    &["--mode", "seeded", "--prepend-only"]] {
+            assert!(c(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -8100,6 +8176,8 @@ mod wordlist_side_tests {
         let no_wl = GenerateArgs { wordlist: None, ..rf() };
         assert!(wordlist_side(&no_wl).is_err());
         assert!(wordlist_side(&GenerateArgs { mode: Some(Mode::Seeded), ..rf() }).is_err());
+        assert!(wordlist_side(&GenerateArgs { append_only_legacy: true, ..rf() }).is_err());
+        assert!(wordlist_side(&GenerateArgs { append_only_legacy: true, ..wl() }).unwrap().is_none());
     }
 
     #[test]
