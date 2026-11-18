@@ -5,7 +5,7 @@ All notable changes to tokenov are recorded here. Versions follow
 or model format, MINOR for new opt-in surface with unchanged default output,
 PATCH for fixes.
 
-## 1.4.1 — unreleased
+## 1.4.1 — 2026-11-17
 
 **`--append-only` output changes in 1.4.1.** Use the new `--append-only-legacy`
 to get the output `--append-only` gave in 1.4.0, which is also the output of
