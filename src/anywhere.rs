@@ -1,7 +1,8 @@
 //! The default `--wordlist` generator: each wordlist word anywhere in the
 //! candidate, `[prefix] + word + [suffix]`, ranked at the plain model's cost.
 //! (`--prepend-only` is the same generator with the word last: no suffix, the
-//! candidate ends right after the word.)
+//! candidate ends right after the word. `--append-only` is the same generator
+//! with the word first: no prefix, so no seam overlap; see `Place::Start`.)
 //!
 //! The prefix is walked from START and the suffix after the word, both through
 //! the variant's child lists, as the enumerator walks any password (so
@@ -420,6 +421,19 @@ impl Overlap {
     }
 }
 
+/// Where the word sits in the candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// The default: model-walked prefix and suffix around the word.
+    Anywhere,
+    /// `--append-only`: the word starts the candidate (no prefix walk, no
+    /// seam overlap). Only the empty-prefix work units run, and each word's
+    /// bound `k` is computed in the one context it can follow, (START, START).
+    Start,
+    /// `--prepend-only`: the word ends the candidate (END only after it).
+    End,
+}
+
 /// What a run emits, besides the model.
 pub struct Opts {
     pub max_tokens:   usize,
@@ -429,8 +443,8 @@ pub struct Opts {
     pub enterprise:   bool,
     /// `--case-shape` patterns; empty = candidates as generated.
     pub case_masks:   Vec<CaseMask>,
-    /// `--prepend-only`: the word ends the candidate (no suffix walk).
-    pub word_at_end:  bool,
+    /// Where the word sits: anywhere, first (--append-only), last (--prepend-only).
+    pub place:        Place,
     /// Weight F of the unigram fallback for word steps; `None` = off.
     pub word_unigram: Option<f32>,
     /// Every lower bound 0 (debug / tests).
@@ -525,9 +539,11 @@ impl Prep<'_> {
     fn lb(&self, x: f32) -> u32 { lb_level(x, self.opts.no_prune) }
 
     /// Work units of one pass: the empty prefix (in `ROOT_PARTS` slices),
-    /// then each first prefix token.
-    #[cfg(test)]
-    fn n_units(&self) -> usize { ROOT_PARTS + self.kids(self.start_id, self.start_id).len() }
+    /// then each first prefix token (none with the word first).
+    fn n_units(&self) -> usize {
+        if self.opts.place == Place::Start { return ROOT_PARTS; }
+        ROOT_PARTS + self.kids(self.start_id, self.start_id).len()
+    }
 }
 
 /// Build the tables. `entry_seqs` = the wordlist's token sequences, in file order.
@@ -536,7 +552,8 @@ pub fn prepare<'a>(inp: Inputs<'a>, entry_seqs: &[Vec<u32>], opts: Opts) -> Resu
     let Inputs { em, variant, decode, kind, start_id, end_id, unigram_raw } = inp;
     let np = opts.no_prune;
     let lbl = |x: f32| lb_level(x, np);
-    let at_end = opts.word_at_end;
+    let at_end = opts.place == Place::End;
+    let at_start = opts.place == Place::Start;
     let n_ids = (start_id.max(end_id) as usize + 1).max(decode.len());
     let uni: Option<Uni> = match opts.word_unigram {
         Some(f) if f > 0.0 && f.is_finite() && em.is_kn && !unigram_raw.is_empty() => {
@@ -618,9 +635,10 @@ pub fn prepare<'a>(inp: Inputs<'a>, entry_seqs: &[Vec<u32>], opts: Opts) -> Resu
     };
 
     // Seam overlap: for every head of a word that some token ends with
-    // (properly), the best context-free split of the rest of the word.
+    // (properly), the best context-free split of the rest of the word. None
+    // with the word first: there is no prefix token to overlap.
     let mut wid_of: Vec<u32> = (0..n_words as u32).collect();
-    {
+    if !at_start {
         let mut sfx: FxHashSet<&[u8]> = FxHashSet::default();
         for b in vocab.keys() { for i in 1..b.len() { sfx.insert(&b[i..]); } }
         let rems: Vec<Vec<(usize, Vec<Vec<u32>>)>> = (0..n_words).into_par_iter().map(|i| {
@@ -772,10 +790,18 @@ pub fn prepare<'a>(inp: Inputs<'a>, entry_seqs: &[Vec<u32>], opts: Opts) -> Resu
     // (--append-only drops the unreachable ones too).
     // Cheapest first child per context (END with --prepend-only).
     let first_kid: Memo<Option<f32>> = Memo::new(50_000_000);
+    // With the word first (`Place::Start`) a word only ever follows (START,
+    // START), so the step after a 1-token word and the word's second step are
+    // taken in that one context: exact values instead of the best over all
+    // contexts (still lower bounds on the costs `block_lp` and `suffix` add).
     let built: Vec<Option<Entry>> = seqs.par_iter().enumerate().map(|(si, s)| {
         let head = head_of[si];
         if s.len() == 1 {
-            let sm = sufmin1[s[0] as usize];
+            let sm = if at_start {
+                let c = pack(start_id, s[0]);
+                let first = first_kid.get_or(c, || (variant.get_children(em, c, s[0]).first().map(|x| x.1), 1));
+                match first { Some(lp) => lp_to_level(lp), None => return None }
+            } else { sufmin1[s[0] as usize] };
             if sm == u32::MAX { return None; }
             return Some(Entry { toks: s.clone(), bi1: None, fixed: Vec::new(), k: sm as f32, uni1: None, head });
         }
@@ -783,7 +809,19 @@ pub fn prepare<'a>(inp: Inputs<'a>, entry_seqs: &[Vec<u32>], opts: Opts) -> Resu
         // The fallback prices the second step only when the pair has no
         // bigram probability (the bigram tier catches it otherwise).
         let uni1 = match &uni { Some(u) if bi1v[pi].is_none() => Some(u.lu(s[1])).filter(|v| v.is_finite()), _ => None };
-        let b1 = match (&uni, uni1) { (Some(u), Some(x)) => best1[pi].max(u.lam_max + x), _ => best1[pi] };
+        let b1 = if at_start {
+            // The second step after (START, s0), tier by tier as `block_lp` takes it.
+            let c1 = pack(start_id, s[0]);
+            let s1 = match em.trigram.get(&c1) {
+                Some(list) => list.iter().find(|(id, _)| *id == s[1]).map(|(_, l)| *l)
+                    .or_else(|| bi1v[pi].map(|x| em.log_lambda.get(&c1).copied().unwrap_or(0.0) + x))
+                    .or_else(|| uni1.map(|x| em.log_lambda.get(&c1).copied().unwrap_or(0.0) + x)),
+                None => bi1v[pi].or(uni1),
+            };
+            match s1 { Some(x) => x, None => return None }
+        } else {
+            match (&uni, uni1) { (Some(u), Some(x)) => best1[pi].max(u.lam_max + x), _ => best1[pi] }
+        };
         if !b1.is_finite() { return None; }
         let mut fixed = Vec::with_capacity(s.len() - 2);
         for k in 2..s.len() {
@@ -835,7 +873,7 @@ pub fn prepare<'a>(inp: Inputs<'a>, entry_seqs: &[Vec<u32>], opts: Opts) -> Resu
     // per prefix token. A remainder after prefix token `b` costs at least its
     // first token's best log P in any context plus its `k`, so `g_b[b]` (and
     // `gfloor`, lowered to cover it) stay lower bounds.
-    let ov = {
+    let ov = if at_start { None } else {
         let n_heads = head_len.len();
         let mut groups: FxHashMap<(u32, u32), Vec<u32>> = FxHashMap::default();
         let mut hk = vec![f32::INFINITY; n_heads];
@@ -907,8 +945,8 @@ pub fn prepare<'a>(inp: Inputs<'a>, entry_seqs: &[Vec<u32>], opts: Opts) -> Resu
     }
     log_msg(&format!(
         "[wordlist] {} words placed ({} duplicate/over-long skipped: {} over --max-tokens; {} cannot be \
-         generated with this model), kmin={:.2} gfloor={} word_at_end={} (prepared in {:.2}s)",
-        entries.len(), entry_seqs.len() - n_words, overlong, n_dropped, kmin_all, gfloor, at_end,
+         generated with this model), kmin={:.2} gfloor={} place={:?} (prepared in {:.2}s)",
+        entries.len(), entry_seqs.len() - n_words, overlong, n_dropped, kmin_all, gfloor, opts.place,
         t_setup.elapsed().as_secs_f64()));
 
     Ok(Prep {
@@ -1127,7 +1165,7 @@ impl Worker {
         let (a, b) = self.ctx(p.start_id);
         let ch = p.kids(a, b);
         let t_lvl = self.target;
-        if p.opts.word_at_end {
+        if p.opts.place == Place::End {
             self.steps += 1;
             if let Some(&(_, lp)) = ch.iter().find(|x| x.0 == p.end_id) {
                 let nl = acc + lp_to_level(lp);
@@ -1304,7 +1342,7 @@ impl Worker {
 /// Returns the last level swept.
 fn sweep(p: &Prep, rt: &Rt, n_threads: usize, start: Pos) -> Result<u32> {
     let root = p.kids(p.start_id, p.start_id);
-    let n_units = ROOT_PARTS + root.len();
+    let n_units = p.n_units();
     if !start.done.is_empty() && start.done.len() != n_units {
         bail!("--resume: the checkpoint has {} work units per level, this run has {} \
                (different model or settings?)", start.done.len(), n_units);
@@ -1711,14 +1749,14 @@ pub fn run(args: &GenerateArgs, inp: Inputs, entry_seqs: &[Vec<u32>], opts: Opts
     log_msg(&format!("[gen] wordlist: total emitted = {}", lines));
     if args.count.is_some() && lines < target {
         if let Some(w) = crate::wordlist_shortfall_warning(args.enterprise, false, args.count, lines,
-                                                          prep.opts.word_at_end) {
+                                                          prep.opts.place == Place::End) {
             warn_msg(&w);
         } else {
             warn_msg(&format!("warning: --wordlist produced {lines} of the {target} candidates requested: \
                                every candidate within --max-tokens / --max-len is used up"));
         }
     } else if let Some(w) = crate::wordlist_shortfall_warning(args.enterprise, false, args.count, lines,
-                                                              prep.opts.word_at_end) {
+                                                              prep.opts.place == Place::End) {
         warn_msg(&w);
     }
     Ok(())
@@ -1955,10 +1993,11 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
 
-    fn opts(at_end: bool, np: bool) -> Opts {
+    fn opts(place: Place, np: bool) -> Opts {
         Opts { max_tokens: 6, min_tokens: 1, min_len: 1, max_len: 30, enterprise: false,
-               case_masks: Vec::new(), word_at_end: at_end, word_unigram: Some(1.0), no_prune: np }
+               case_masks: Vec::new(), place, word_unigram: Some(1.0), no_prune: np }
     }
+    const ANY: Place = Place::Anywhere;
 
     /// Run a strict sweep to `count` from `start`, after restoring `prior`.
     fn sweep_to_vec(em: &EnumModel, variant: &dyn Variant, o: Opts, count: u64, start: Pos,
@@ -1982,18 +2021,18 @@ mod tests {
     fn lines(v: &[u8]) -> Vec<&[u8]> { v.split(|&c| c == b'\n').filter(|l| !l.is_empty()).collect() }
 
     /// The bounds only skip work: with every bound at 0 the sweep emits the
-    /// same bytes, for the plain model, a unigram-tail model, and the
-    /// word-at-end mode.
+    /// same bytes, for the plain model, a unigram-tail model, and each
+    /// placement (anywhere, word first, word last).
     #[test]
     fn pruned_sweep_equals_unpruned_sweep() {
         for tail in [false, true] {
             let em = synth_em(tail);
             let var: &dyn Variant = if tail { &crate::variant_b::B } else { &crate::variant_a::A };
-            for at_end in [false, true] {
-                let a = sweep_to_vec(&em, var, opts(at_end, false), 400, Pos::default(), &[]);
-                let b = sweep_to_vec(&em, var, opts(at_end, true), 400, Pos::default(), &[]);
-                assert!(lines(&a).len() > 50, "tail={tail} at_end={at_end}: only {} lines", lines(&a).len());
-                assert_eq!(String::from_utf8_lossy(&a), String::from_utf8_lossy(&b), "tail={tail} at_end={at_end}");
+            for place in [Place::Anywhere, Place::Start, Place::End] {
+                let a = sweep_to_vec(&em, var, opts(place, false), 400, Pos::default(), &[]);
+                let b = sweep_to_vec(&em, var, opts(place, true), 400, Pos::default(), &[]);
+                assert!(lines(&a).len() > 50, "tail={tail} {place:?}: only {} lines", lines(&a).len());
+                assert_eq!(String::from_utf8_lossy(&a), String::from_utf8_lossy(&b), "tail={tail} {place:?}");
                 let mut u = lines(&a);
                 u.sort();
                 let n = u.len();
@@ -2007,11 +2046,53 @@ mod tests {
     #[test]
     fn word_at_end_lines_end_with_a_word() {
         let em = synth_em(false);
-        let v = sweep_to_vec(&em, &crate::variant_a::A, opts(true, false), 300, Pos::default(), &[]);
+        let v = sweep_to_vec(&em, &crate::variant_a::A, opts(Place::End, false), 300, Pos::default(), &[]);
         let words: [&[u8]; 4] = [b"ab", b"1", b"b!", b"ia"];
         for l in lines(&v) {
             assert!(words.iter().any(|w| l.ends_with(w)), "{}", String::from_utf8_lossy(l));
         }
+    }
+
+    /// With --append-only every line starts with a word, and the lines are
+    /// exactly the default run's lines that come from the empty prefix: the
+    /// same set as filtering an unpruned word-first sweep, at every level.
+    #[test]
+    fn word_at_start_lines_start_with_a_word() {
+        let em = synth_em(false);
+        let v = sweep_to_vec(&em, &crate::variant_a::A, opts(Place::Start, false), 300, Pos::default(), &[]);
+        let ls = lines(&v);
+        assert!(ls.len() > 50, "only {} lines", ls.len());
+        let words: [&[u8]; 5] = [b"ab", b"1", b"b!", b"ia", b"ab1"];
+        for l in &ls {
+            assert!(words.iter().any(|w| l.starts_with(w)), "{}", String::from_utf8_lossy(l));
+        }
+        let mut u = ls.clone();
+        u.sort();
+        u.dedup();
+        assert_eq!(u.len(), ls.len(), "duplicate lines");
+        // One unit per empty-prefix slice, none per prefix token.
+        let decode = synth_decode();
+        let counts = vec![1u64; 11];
+        let inp = Inputs { em: &em, variant: &crate::variant_a::A, decode: &decode, kind: DecodeKind::Plain,
+                           start_id: START, end_id: END, unigram_raw: &counts };
+        let p = prepare(inp, &[vec![3u32], vec![2]], opts(Place::Start, false)).unwrap();
+        assert_eq!(p.n_units(), ROOT_PARTS);
+        assert!(p.ov.is_none());
+    }
+
+    /// With the word first, every line is one the default generator also
+    /// writes (its empty-prefix lines), and the strings it starts with a word
+    /// at levels it finished all appear.
+    #[test]
+    fn word_at_start_is_the_default_without_a_prefix() {
+        let em = synth_em(false);
+        let a: &dyn Variant = &crate::variant_a::A;
+        let o = |place| Opts { max_tokens: 4, ..opts(place, false) };
+        let start = sweep_to_vec(&em, a, o(Place::Start), 1_000_000, Pos::default(), &[]);
+        let any = sweep_to_vec(&em, a, o(ANY), 1_000_000, Pos::default(), &[]);
+        let any: FxHashSet<&[u8]> = lines(&any).into_iter().collect();
+        assert!(lines(&start).len() > 50);
+        for l in lines(&start) { assert!(any.contains(l), "{}", String::from_utf8_lossy(l)); }
     }
 
     /// Resume: restore the first lines into the dedupe set and re-run from the
@@ -2019,10 +2100,10 @@ mod tests {
     #[test]
     fn resume_from_written_lines_continues_byte_for_byte() {
         let em = synth_em(false);
-        let full = sweep_to_vec(&em, &crate::variant_a::A, opts(false, false), 300, Pos::default(), &[]);
+        let full = sweep_to_vec(&em, &crate::variant_a::A, opts(ANY, false), 300, Pos::default(), &[]);
         let ls = lines(&full);
         for cut in [0usize, 1, 37, 150, 299] {
-            let rest = sweep_to_vec(&em, &crate::variant_a::A, opts(false, false), 300, Pos::default(), &ls[..cut]);
+            let rest = sweep_to_vec(&em, &crate::variant_a::A, opts(ANY, false), 300, Pos::default(), &ls[..cut]);
             let mut want: Vec<u8> = Vec::new();
             for l in &ls[cut..] { want.extend_from_slice(l); want.push(b'\n'); }
             assert_eq!(String::from_utf8_lossy(&rest), String::from_utf8_lossy(&want), "cut {cut}");
@@ -2037,7 +2118,7 @@ mod tests {
         let counts = vec![1u64; 11];
         let inp = Inputs { em: &em, variant: &crate::variant_a::A, decode: &decode, kind: DecodeKind::Plain,
                            start_id: START, end_id: END, unigram_raw: &counts };
-        let p = prepare(inp, &[vec![3u32], vec![2]], opts(false, false)).unwrap();
+        let p = prepare(inp, &[vec![3u32], vec![2]], opts(ANY, false)).unwrap();
         let n = p.n_units();
         let start = Pos { level: 0, units: n, done: vec![true; n], deferred: false };
         let buf = Arc::new(Mutex::new(Vec::new()));
@@ -2066,9 +2147,9 @@ mod tests {
     fn transforms_are_the_plain_stream_transformed() {
         let em = synth_em(false);
         let a: &dyn Variant = &crate::variant_a::A;
-        let plain = sweep_to_vec(&em, a, opts(false, false), 20_000, Pos::default(), &[]);
+        let plain = sweep_to_vec(&em, a, opts(ANY, false), 20_000, Pos::default(), &[]);
         // --enterprise (min length 8 here, so long lines only).
-        let mut o = opts(false, false);
+        let mut o = opts(ANY, false);
         o.enterprise = true;
         let got = take(&sweep_to_vec(&em, a, o, 40, Pos::default(), &[]));
         let want = derive(&plain, &|l: &[u8]| match enterprise::decide(l) {
@@ -2080,14 +2161,14 @@ mod tests {
         assert_eq!(got[..], want[..40]);
         // --case-shape "lower;upper": both forms of each candidate, in order
         // (`lower` leaves a token as it is, as in the enumerator).
-        let mut o = opts(false, false);
+        let mut o = opts(ANY, false);
         o.case_masks = CaseMask::parse_spec("lower;upper").unwrap();
         let got = take(&sweep_to_vec(&em, a, o, 300, Pos::default(), &[]));
         let want = derive(&plain, &|l: &[u8]| vec![l.to_vec(), l.to_ascii_uppercase()]);
         assert_eq!(got.len(), 300);
         assert_eq!(got[..], want[..300]);
         // --min-len / --max-len filter the same stream.
-        let mut o = opts(false, false);
+        let mut o = opts(ANY, false);
         o.min_len = 4; o.max_len = 6;
         let got = take(&sweep_to_vec(&em, a, o, 300, Pos::default(), &[]));
         let want = derive(&plain, &|l: &[u8]| if (4..=6).contains(&l.len()) { vec![l.to_vec()] } else { vec![] });
@@ -2100,7 +2181,7 @@ mod tests {
     #[test]
     fn case_shape_applies_per_token_and_dedupes() {
         let em = synth_em(false);
-        let mut o = opts(false, false);
+        let mut o = opts(ANY, false);
         o.case_masks = CaseMask::parse_spec("lower;?u?l").unwrap();
         let v = sweep_to_vec(&em, &crate::variant_a::A, o, 200, Pos::default(), &[]);
         let ls = lines(&v);

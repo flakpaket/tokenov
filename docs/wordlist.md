@@ -44,7 +44,7 @@ In our tests on leaked passwords of staff at nine large companies (people with
 a corporate email address, leaked mostly from third-party sites), with a
 wordlist scraped from each company's website, on the passwords left after
 running that wordlist through hashcat's dive rules, the default cracked about
-65% more than `--append-only` (the `--wordlist` of tokenov 1.3 and earlier) at
+65% more than `--append-only-legacy` (the `--wordlist` of tokenov 1.3 and earlier) at
 100 million candidates, and more at every one of the nine companies. Because
 these were mostly passwords for personal accounts, not for the companies' own
 systems (only about 6% met a typical domain complexity policy), treat the
@@ -57,20 +57,28 @@ printed: about 16 bytes each, so 1.6 GB per 100 million. A run without
 
 ## Choosing a generator
 
+The word can sit in three places. All three use the same generator:
+
 | flags | where the added characters go | order |
 |---|---|---|
 | (none) | before, after, or both | likeliest first across all words |
+| `--append-only` | after the word only: the word starts the candidate (`cisco2024!`) | likeliest first across all words |
 | `--prepend-only` | before the word only: the word ends the candidate (`ilovecisco`, `2024cisco`) | likeliest first across all words |
-| `--append-only` | after the word only: the word starts the candidate (`cisco2024!`). This is how `--wordlist` worked up to tokenov 1.3; the output is the same as 1.3.0's | likeliest first across all words |
+
+Two more generators:
+
+| flags | where the added characters go | order |
+|---|---|---|
+| `--append-only-legacy` | after the word only, generated as in tokenov 1.3: reproduces 1.3-era `--wordlist` results | likeliest first across all words |
 | `--rare-first` | either side, or one side with `--append-only` / `--prepend-only` | the rarest words get the most candidates; to be deprecated |
 
-**Start with the default.** Use `--append-only` to reproduce the output of
-earlier versions, and `--prepend-only` when you know the word ends the
-password.
+**Start with the default.** Use `--append-only` when you know the word starts
+the password, `--prepend-only` when you know it ends it, and
+`--append-only-legacy` to reproduce the output of earlier versions.
 
 ## Flags with the default generator
 
-Every `generate` flag works, with `--prepend-only` too:
+Every `generate` flag works, with `--append-only` and `--prepend-only` too:
 
 - **`--strict`** gives one exactly ordered stream, byte-identical on every run.
   Without it, threads share out the work and lines arrive in the order the
@@ -99,13 +107,35 @@ Every `generate` flag works, with `--prepend-only` too:
 - `--lazy`, `--force-child-cache` and `--bounded-cap` tune a cache this
   generator does not use: they print a warning and are ignored.
 
-## `--append-only`: after the word, as before 1.4
+## `--append-only`: after the word
 
-Each word is the start of the candidate, and the model adds characters after
-it. Candidates come out in order of how likely the model finds the whole
-password, across all words. The output is byte-identical to tokenov 1.3.0's
-`--wordlist`, so use this flag to reproduce older runs. Every `generate` flag
-works.
+The default generator with nothing before the word: each word starts the
+candidate and the model adds characters after it (`cisco`, `cisco1`,
+`cisco2024!`). Candidates come out in order of how likely the model finds the
+whole password, across all words, and every line is unique.
+
+Before tokenov 1.4.1, `--append-only` ran the tokenov 1.3 generator. That
+generator is now `--append-only-legacy`. The two place words the same way and
+price candidates the same way, so they mostly print the same lines. The new
+`--append-only` differs in three ways:
+
+- it prints each password once; the old generator can print the same
+  password more than once when it is built from different token splits;
+- words the model has no statistics for inside the word come out too (see
+  "How it works" above), where the old generator skipped them;
+- because of those two, the same `--count` reaches a little further.
+
+## `--append-only-legacy`: tokenov 1.3-era results
+
+Reproduces tokenov 1.3-era `--wordlist` results: its output is byte-identical
+to `--wordlist` in tokenov 1.3.0 and `--append-only` in tokenov 1.4.0, so use it
+to repeat an older run or compare against one. Each word is the start of the
+candidate, and the model adds characters after it, likeliest first across all
+words.
+
+Every `generate` flag works, including `--lazy`, `--force-child-cache` and
+`--bounded-cap`. It cannot be combined with `--append-only`, `--prepend-only`
+or `--rare-first`. Checkpoints and `--resume` work as in standard mode.
 
 ## `--prepend-only`: before the word
 

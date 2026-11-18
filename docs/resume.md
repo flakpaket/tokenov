@@ -51,7 +51,7 @@ there's no saved position, and `--resume` falls back to re-running the
 deterministic stream and skipping the first N already-written candidates via
 the sidecar.
 
-**`--wordlist`** (the default generator and `--prepend-only`) saves one
+**`--wordlist`** (the default generator, `--append-only` and `--prepend-only`) saves one
 position for the whole run: the level it is on and which parts of that level
 are finished. `--resume` continues from there. It re-generates the unfinished
 parts of that level and leaves out every line already written, so nothing is
@@ -61,5 +61,5 @@ checkpoint), or, when the run writes to stdout, a file of 8 bytes per written
 line kept next to the checkpoint (`<checkpoint>.seen`, removed when the run
 finishes). Writing to stdout, the lines printed after the last checkpoint come
 out again, as in standard mode. Strict runs resume without `--output` too.
-`--append-only` and `--rare-first` resume as described above.
+`--append-only-legacy` and `--rare-first` resume as described above.
 

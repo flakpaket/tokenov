@@ -37,7 +37,8 @@ table lists the main flags; `tokenov generate --help` lists all of them.
 | `--case-shape <SPEC>` | re-case each token (per-slot `?l`/`?c`/`?u`, or `lower`/`cap1`/`title`/`upper`; `;`-separated) | (off) |
 | `--enterprise` | emit only policy-compliant candidates (≥8 chars + ≥3 of 5 classes; capitalize-first repair) | (off) |
 | `--wordlist <PATH>` | target wordlist (one entry per line); the model adds characters before, after or on both sides of each word, likeliest first across all words | (none → standard mode) |
-| `--append-only` | with `--wordlist`: add characters after each word only (the output of `--wordlist` in tokenov 1.3 and earlier) | (off) |
+| `--append-only` | with `--wordlist`: add characters after each word only; the word starts the candidate | (off) |
+| `--append-only-legacy` | with `--wordlist`: add characters after each word only, as tokenov 1.3 did; reproduces 1.3-era `--wordlist` results (the output of `--wordlist` in 1.3 and `--append-only` in 1.4.0). Not with `--rare-first` | (off) |
 | `--prepend-only` | with `--wordlist`: add characters before each word only; the word ends the candidate | (off) |
 | `--rare-first` | rarest words get the most candidates; the model adds characters on either side (one side with `--append-only` / `--prepend-only`); to be deprecated | (off) |
 | `--rarity-weight <P>` | with `--rare-first`: each word's share ∝ rarity^P (0 = equal shares) | 1.0 |
