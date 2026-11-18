@@ -19,7 +19,8 @@ to get the output `--append-only` gave in 1.4.0, which is also the output of
   the start of the candidate and the model adding characters after it
   (`cisco2024!`). The three placements (anywhere, `--append-only`,
   `--prepend-only`) now work the same way. Compared with 1.4.0's
-  `--append-only`, mostly the same lines come out, in the same order, except:
+  `--append-only`, the same passwords come out at each level of likelihood,
+  except:
   - every line is unique (the old generator could print a password more than
     once, built from different token splits), so `--count` reaches a little
     further;
